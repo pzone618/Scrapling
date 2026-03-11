@@ -74,6 +74,18 @@ Please follow these coding conventions as we do when writing code for Scrapling:
    ```
 
 2. Create a virtual environment and install dependencies:
+   
+   **Using uv (recommended for faster setup):**
+   ```bash
+   # Install uv if you haven't already
+   curl -LsSf https://astral.sh/uv/install.sh | sh  # Unix/macOS
+   # Or on Windows: irm https://astral.sh/uv/install.ps1 | iex
+   
+   # Install all development dependencies
+   uv sync --extra dev
+   ```
+   
+   **Using pip:**
    ```bash
    python -m venv .venv
    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
@@ -83,11 +95,20 @@ Please follow these coding conventions as we do when writing code for Scrapling:
 
 3. Install browser dependencies:
    ```bash
+   # If using uv
+   uv run scrapling install
+   
+   # If using pip
    scrapling install
    ```
 
 4. Set up pre-commit hooks:
    ```bash
+   # If using uv
+   uv pip install pre-commit
+   uv run pre-commit install
+   
+   # If using pip
    pip install pre-commit
    pre-commit install
    ```
@@ -105,7 +126,37 @@ pip3 install git+https://github.com/D4Vinci/Scrapling.git@dev
 ```
 
 ## Tests
-Scrapling includes a comprehensive test suite that can be executed with pytest. However, first, you need to install all libraries and `pytest-plugins` listed in `tests/requirements.txt`. Then, running the tests will result in an output like this:
+Scrapling includes a comprehensive test suite that can be executed with pytest. 
+
+### Running tests
+
+**Using uv:**
+```bash
+# Run all tests in parallel
+uv run pytest tests -n auto
+
+# Run specific test categories
+uv run pytest tests/ -k "not (DynamicFetcher or StealthyFetcher)" -n auto  # Non-browser tests
+uv run pytest tests/ -k "DynamicFetcher or StealthyFetcher"                 # Browser tests
+
+# Check test coverage
+uv run pytest --cov=scrapling tests/
+```
+
+**Using pip:**
+```bash
+# Run all tests in parallel
+pytest tests -n auto
+
+# Run specific test categories
+pytest tests/ -k "not (DynamicFetcher or StealthyFetcher)" -n auto  # Non-browser tests
+pytest tests/ -k "DynamicFetcher or StealthyFetcher"                 # Browser tests
+
+# Check test coverage
+pytest --cov=scrapling tests/
+```
+
+Example output:
    ```bash
    $ pytest tests -n auto
    =============================== test session starts ===============================
@@ -122,24 +173,23 @@ Scrapling includes a comprehensive test suite that can be executed with pytest. 
 
    =============================== 271 passed in 52.68s ==============================
    ```
+
 Here, `-n auto` runs tests in parallel across multiple processes to increase speed.
 
-**Note:** You may need to run browser tests sequentially (`DynamicFetcher`/`StealthyFetcher`) to avoid conflicts. To run non-browser tests in parallel and browser tests separately:
-```bash
-# Non-browser tests (parallel)
-pytest tests/ -k "not (DynamicFetcher or StealthyFetcher)" -n auto
-
-# Browser tests (sequential)
-pytest tests/ -k "DynamicFetcher or StealthyFetcher"
-```
-
-Bonus: You can also see the test coverage with the `pytest` plugin below
-```bash
-pytest --cov=scrapling tests/
-```
+**Note:** You may need to run browser tests sequentially (`DynamicFetcher`/`StealthyFetcher`) to avoid conflicts. To run non-browser tests in parallel and browser tests separately, use the commands shown above.
 
 ## Building Documentation
 Documentation is built using [Zensical](https://zensical.org/). You can build it locally using the following commands:
+
+**Using uv:**
+```bash
+uv pip install zensical
+uv pip install -r docs/requirements.txt
+uv run zensical build --clean  # Build the static site
+uv run zensical serve          # Local preview
+```
+
+**Using pip:**
 ```bash
 pip install zensical
 pip install -r docs/requirements.txt

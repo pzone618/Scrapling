@@ -16,6 +16,8 @@
     <br/>
     <a href="https://github.com/D4Vinci/Scrapling/blob/main/docs/README_AR.md">العربيه</a> | <a href="https://github.com/D4Vinci/Scrapling/blob/main/docs/README_ES.md">Español</a> | <a href="https://github.com/D4Vinci/Scrapling/blob/main/docs/README_FR.md">Français</a> | <a href="https://github.com/D4Vinci/Scrapling/blob/main/docs/README_DE.md">Deutsch</a> | <a href="https://github.com/D4Vinci/Scrapling/blob/main/docs/README_CN.md">简体中文</a> | <a href="https://github.com/D4Vinci/Scrapling/blob/main/docs/README_JP.md">日本語</a> |  <a href="https://github.com/D4Vinci/Scrapling/blob/main/docs/README_RU.md">Русский</a>
     <br/>
+    📖 <strong><a href="https://github.com/D4Vinci/Scrapling/blob/main/QUICKSTART_CN.md">中文快速入门指南</a></strong> | 📁 <strong><a href="https://github.com/D4Vinci/Scrapling/tree/main/examples">Code Examples</a></strong>
+    <br/>
     <a href="https://github.com/D4Vinci/Scrapling/actions/workflows/tests.yml" alt="Tests">
         <img alt="Tests" src="https://github.com/D4Vinci/Scrapling/actions/workflows/tests.yml/badge.svg"></a>
     <a href="https://badge.fury.io/py/Scrapling" alt="PyPI version">
@@ -375,6 +377,43 @@ scrapling extract stealthy-fetch 'https://nopecha.com/demo/cloudflare' captchas.
 > [!NOTE]
 > There are many additional features, but we want to keep this page concise, including the MCP server and the interactive Web Scraping Shell. Check out the full documentation [here](https://scrapling.readthedocs.io/en/latest/)
 
+## 📚 Examples
+
+Want to see Scrapling in action? Check out our **[examples directory](https://github.com/D4Vinci/Scrapling/tree/main/examples)** with ready-to-run code:
+
+- **Basic Scraping** - Simple data extraction examples
+- **Stealth Mode** - Bypassing anti-bot protection
+- **Session Management** - Maintaining cookies and state
+- **Spider Framework** - Full-scale concurrent crawling
+- **Adaptive Scraping** - Auto-adapting to website changes
+- **Proxy Rotation** - IP management and rotation
+
+Run any example:
+```bash
+# With uv (recommended)
+uv run python examples/01_basic_scraping.py
+
+# With pip
+python examples/01_basic_scraping.py
+```
+
+**📖 [Quick Start Guide (中文)](QUICKSTART_CN.md)** - Comprehensive Chinese language guide with examples and best practices.
+
+## 🛠️ Utility Scripts
+
+The **[scripts directory](scripts/)** contains practical utility scripts for common tasks:
+
+- **IELTS Scraper** (`scripts/ielts_scraper.py`) - Scrape IELTS reading test pages with automatic output organization
+
+All scripts save their output to the `output/` directory (ignored by git) to keep the project root clean.
+
+```bash
+# Run a utility script
+uv run python scripts/ielts_scraper.py
+```
+
+See [scripts/README.md](scripts/README.md) for detailed documentation on available scripts.
+
 ## Performance Benchmarks
 
 Scrapling isn't just powerful—it's also blazing fast. The following benchmarks compare Scrapling's parser with the latest versions of other popular libraries.
@@ -407,7 +446,27 @@ Scrapling's adaptive element finding capabilities significantly outperform alter
 
 ## Installation
 
-Scrapling requires Python 3.10 or higher:
+Scrapling requires Python 3.10 or higher.
+
+### Using uv (Recommended)
+
+[uv](https://github.com/astral-sh/uv) is a fast Python package installer and resolver:
+
+```bash
+# Install uv if you haven't already
+curl -LsSf https://astral.sh/uv/install.sh | sh  # Unix/macOS
+# Or on Windows: irm https://astral.sh/uv/install.ps1 | iex
+
+# Install Scrapling
+uv pip install scrapling
+
+# Or create a new project with uv
+uv init my-scraper
+cd my-scraper
+uv add scrapling
+```
+
+### Using pip
 
 ```bash
 pip install scrapling
@@ -418,11 +477,21 @@ This installation only includes the parser engine and its dependencies, without 
 ### Optional Dependencies
 
 1. If you are going to use any of the extra features below, the fetchers, or their classes, you will need to install fetchers' dependencies and their browser dependencies as follows:
+    
+    **Using uv:**
+    ```bash
+    uv pip install "scrapling[fetchers]"
+    
+    uv run scrapling install           # normal install
+    uv run scrapling install --force   # force reinstall
+    ```
+    
+    **Using pip:**
     ```bash
     pip install "scrapling[fetchers]"
     
     scrapling install           # normal install
-    scrapling install  --force  # force reinstall
+    scrapling install --force   # force reinstall
     ```
 
     This downloads all browsers, along with their system dependencies and fingerprint manipulation dependencies.
@@ -438,17 +507,34 @@ This installation only includes the parser engine and its dependencies, without 
 2. Extra features:
    - Install the MCP server feature:
        ```bash
+       # Using uv
+       uv pip install "scrapling[ai]"
+       # Using pip
        pip install "scrapling[ai]"
        ```
    - Install shell features (Web Scraping shell and the `extract` command): 
        ```bash
+       # Using uv
+       uv pip install "scrapling[shell]"
+       # Using pip
        pip install "scrapling[shell]"
        ```
    - Install everything: 
        ```bash
+       # Using uv
+       uv pip install "scrapling[all]"
+       # Using pip
        pip install "scrapling[all]"
        ```
-   Remember that you need to install the browser dependencies with `scrapling install` after any of these extras (if you didn't already)
+   - Install development dependencies (for contributors):
+       ```bash
+       # Using uv (recommended for dev)
+       uv sync --extra dev
+       # Using pip
+       pip install "scrapling[dev]"
+       ```
+   
+   Remember that you need to install the browser dependencies with `scrapling install` (or `uv run scrapling install` if using uv) after any of these extras (if you didn't already)
 
 ### Docker
 You can also install a Docker image with all extras and browsers with the following command from DockerHub:

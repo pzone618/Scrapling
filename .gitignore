@@ -2,6 +2,8 @@
 site/*
 local_tests/*
 .mcpregistry_*
+output/*
+!output/.gitkeep
 
 # AI related files
 .claude/*
@@ -37,6 +39,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# uv - only ignore python version file, keep uv.lock for reproducibility
+.python-version
 
 # C extensions
 *.so
