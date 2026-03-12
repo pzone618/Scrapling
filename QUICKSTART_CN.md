@@ -28,6 +28,24 @@
 
 ---
 
+## 📦 安装 (必做)
+
+1. **安装 Scrapling 及扩展依赖**：
+   推荐使用 `uv` 进行安装（速度极快）。我们要安装包含命令行、AI MCP 服务和各种抓取器依赖的完整版：
+   ```bash
+   uv pip install "scrapling[all]"
+   ```
+   *(如果使用 pip，则执行 `pip install "scrapling[all]" `)*
+
+2. **下载并配置内置浏览器内核**（关键步骤）：
+   必须执行此命令以同步 Playwright 内核、Patchright 环境以及反爬虫相关的伪装指纹信息：
+   ```bash
+   uv run scrapling install
+   ```
+   *(如果使用 pip，则直接执行 `scrapling install`)*
+
+---
+
 ## 🚀 快速开始（3 分钟）
 
 ### 方法 1: 命令行使用（不写代码）

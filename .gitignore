@@ -5,15 +5,25 @@ local_tests/*
 output/*
 !output/.gitkeep
 
-# AI related files
-.claude/*
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+Icon
+
+# AI / IDE related files
+.claude/
 CLAUDE.md
+.cursor/
+.cursorrules
+.windsurf/
+.zed/
 
 # cached files
 __pycache__/
 *.py[cod]
 .cache
-.DS_Store
 *~
 .*.sw[po]
 .build
