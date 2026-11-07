@@ -288,7 +288,7 @@ def preview_data(data):
 def main():
     """主函数"""
     # IELTS 听力测试 URL
-    url = 'https://engnovate.com/ielts-listening-tests/cambridge-ielts-20-academic-listening-test-4/'
+    url = 'https://engnovate.com/ielts-listening-tests/cambridge-ielts-19-academic-listening-test-2/'
     
     # 也可以爬取阅读测试
     # url = 'https://engnovate.com/ielts-reading-tests/cambridge-ielts-20-academic-reading-test-4/'

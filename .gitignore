@@ -15,6 +15,34 @@ output/*
 # Runtime marker created by `scrapling install`
 scrapling/.scrapling_dependencies_installed
 
+# Downloaded media / partial downloads from scraper scripts (anywhere in the repo)
+*.mp3
+*.m4a
+*.aac
+*.wav
+*.ogg
+*.flac
+*.mp4
+*.webm
+*.part
+*.crdownload
+*.tmp
+
+# Scratch / personal notes & study material
+scratch/
+notes/
+*.local.md
+*.local.json
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# direnv / local env tooling
+.envrc
+.direnv/
+.tool-versions
+
 # Scrapling adaptive-storage / crawl artefacts
 *.db
 *.db-*
