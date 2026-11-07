@@ -1,16 +1,20 @@
 import json
 import pprint
 from pathlib import Path
+from urllib.parse import urlparse
 
 import anyio
 from anyio import Path as AsyncPath
 from anyio import create_task_group, CapacityLimiter, create_memory_object_stream, EndOfStream
 
 from scrapling.core.utils import log
-from scrapling.spiders.request import Request
 from scrapling.spiders.scheduler import Scheduler
 from scrapling.spiders.session import SessionManager
+from scrapling.spiders.request import Request, Response
+from scrapling.spiders.robotstxt import RobotsTxtManager
 from scrapling.spiders.result import CrawlStats, ItemList
+from scrapling.spiders.throttle import AutoThrottle, parse_retry_after
+from scrapling.spiders.cache import ResponseCacheManager
 from scrapling.spiders.checkpoint import CheckpointManager, CheckpointData
 from scrapling.core._types import Dict, Union, Optional, TYPE_CHECKING, Any, AsyncGenerator
 
@@ -38,12 +42,44 @@ class CrawlerEngine:
             include_kwargs=spider.fp_include_kwargs,
             include_headers=spider.fp_include_headers,
             keep_fragments=spider.fp_keep_fragments,
+            crawl_strategy=getattr(spider, "crawl_strategy", "bfs"),
         )
         self.stats = CrawlStats()
+
+        if self.spider.robots_txt_obey:
+
+            async def _fetch_robots(url: str, sid: str) -> Response:
+                return await self.session_manager.fetch(Request(url, sid=sid))
+
+            self._robots_manager: Optional[RobotsTxtManager] = RobotsTxtManager(_fetch_robots)
+        else:
+            self._robots_manager = None
+
+        if self.spider.development_mode:
+            cache_dir = self.spider.development_cache_dir or f".scrapling_cache/{self.spider.name}"
+            self._cache_manager: Optional[ResponseCacheManager] = ResponseCacheManager(cache_dir)
+            log.warning("Development mode enabled -- responses will be cached to disk and replayed on subsequent runs")
+        else:
+            self._cache_manager = None
+
+        if self.spider.autothrottle_enabled:
+            self._autothrottle: Optional[AutoThrottle] = AutoThrottle(
+                start_delay=self.spider.autothrottle_start_delay,
+                max_delay=self.spider.autothrottle_max_delay,
+                target_concurrency=(
+                    self.spider.autothrottle_target_concurrency or self.spider.concurrent_requests_per_domain or 1.0
+                ),
+                block_backoff=self.spider.autothrottle_block_backoff,
+            )
+        else:
+            self._autothrottle = None
 
         self._global_limiter = CapacityLimiter(spider.concurrent_requests)
         self._domain_limiters: dict[str, CapacityLimiter] = {}
         self._allowed_domains: set[str] = spider.allowed_domains or set()
+
+        if self.spider.robots_txt_obey:
+            self._domain_delays: dict[str, float] = {}
 
         self._active_tasks: int = 0
         self._running: bool = False
@@ -68,11 +104,42 @@ class CrawlerEngine:
                 return True
         return False
 
+    async def _get_domain_delay(self, request: Request) -> float:
+        """Resolve the effective download delay for a domain.
+
+        Takes the max of the spider's configured delay and any robots.txt
+        directives (Crawl-delay / Request-rate). Result is cached per domain.
+        """
+        robots_manager = self._robots_manager
+        if robots_manager is None:
+            return self.spider.download_delay
+
+        domain = request.domain
+
+        if domain in self._domain_delays:
+            return self._domain_delays[domain]
+
+        # For domains covered by _prefetch_robots_txt this is a local parser read.
+        # Domains discovered mid-crawl (not in start_urls) will fetch here.
+        c_delay, r_rate = await robots_manager.get_delay_directives(request.url, request.sid)
+
+        delay = self.spider.download_delay
+
+        if r_rate:
+            req_count, period = r_rate
+            if req_count > 0:
+                delay = max(delay, period / req_count)
+
+        if c_delay is not None:
+            delay = max(delay, c_delay)
+
+        self._domain_delays[domain] = delay
+        return delay
+
     def _rate_limiter(self, domain: str) -> CapacityLimiter:
         """Get or create a per-domain concurrency limiter if enabled, otherwise use the global limiter."""
         if self.spider.concurrent_requests_per_domain:
-            if domain not in self._domain_limiters:
-                self._domain_limiters[domain] = CapacityLimiter(self.spider.concurrent_requests_per_domain)
+            self._domain_limiters.setdefault(domain, CapacityLimiter(self.spider.concurrent_requests_per_domain))
             return self._domain_limiters[domain]
         return self._global_limiter
 
@@ -85,47 +152,8 @@ class CrawlerEngine:
         if not request.sid:
             request.sid = self.session_manager.default_session_id
 
-    async def _process_request(self, request: Request) -> None:
-        """Download and process a single request."""
-        async with self._rate_limiter(request.domain):
-            if self.spider.download_delay:
-                await anyio.sleep(self.spider.download_delay)
-
-            if request._session_kwargs.get("proxy"):
-                self.stats.proxies.append(request._session_kwargs["proxy"])
-            if request._session_kwargs.get("proxies"):
-                self.stats.proxies.append(dict(request._session_kwargs["proxies"]))
-            try:
-                response = await self.session_manager.fetch(request)
-                self.stats.increment_requests_count(request.sid or self.session_manager.default_session_id)
-                self.stats.increment_response_bytes(request.domain, len(response.body))
-                self.stats.increment_status(response.status)
-
-            except Exception as e:
-                self.stats.failed_requests_count += 1
-                await self.spider.on_error(request, e)
-                return
-
-        if await self.spider.is_blocked(response):
-            self.stats.blocked_requests_count += 1
-            if request._retry_count < self.spider.max_blocked_retries:
-                retry_request = request.copy()
-                retry_request._retry_count += 1
-                retry_request.priority -= 1  # Don't retry immediately
-                retry_request.dont_filter = True
-                retry_request._session_kwargs.pop("proxy", None)
-                retry_request._session_kwargs.pop("proxies", None)
-
-                new_request = await self.spider.retry_blocked_request(retry_request, response)
-                self._normalize_request(new_request)
-                await self.scheduler.enqueue(new_request)
-                log.info(
-                    f"Scheduled blocked request for retry ({retry_request._retry_count}/{self.spider.max_blocked_retries}): {request.url}"
-                )
-            else:
-                log.warning(f"Max retries exceeded for blocked request: {request.url}")
-            return
-
+    async def _run_callbacks(self, request: Request, response: Response) -> None:
+        """Dispatch response to the request's callback and process yielded items/requests."""
         callback = request.callback if request.callback else self.spider.parse
         try:
             async for result in callback(response):
@@ -155,11 +183,98 @@ class CrawlerEngine:
             log.error(msg, exc_info=e)
             await self.spider.on_error(request, e)
 
+    async def _process_request(self, request: Request) -> None:
+        """Download and process a single request."""
+        if self._robots_manager:
+            can_fetch = await self._robots_manager.can_fetch(request.url, request.sid)
+            if not can_fetch:
+                self.stats.robots_disallowed_count += 1
+                log.info(f"Request disallowed by robots.txt: {request.url}")
+                return
+            floor = await self._get_domain_delay(request)
+        else:
+            floor = self.spider.download_delay
+
+        delay = floor
+
+        if self._cache_manager and request._fp is not None:
+            cached = await self._cache_manager.get(request._fp)
+            if cached is not None:
+                cached.request = request
+                # Cached responses are rebuilt without meta, so merge the request's in as the live path does
+                cached.meta = {**request.meta, **cached.meta}
+                self.stats.cache_hits += 1
+                self.stats.increment_requests_count(request.sid or self.session_manager.default_session_id)
+                self.stats.increment_response_bytes(request.domain, len(cached.body))
+                self.stats.increment_status(cached.status)
+                log.debug(f"Cache hit: {request.url}")
+                await self._run_callbacks(request, cached)
+                return
+
+        async with self._rate_limiter(request.domain):
+            if self._autothrottle:
+                delay = self._autothrottle.delay_for(request.domain, floor)
+
+            if delay:
+                await anyio.sleep(delay)
+
+            if request._session_kwargs.get("proxy"):
+                self.stats.proxies.append(request._session_kwargs["proxy"])
+            if request._session_kwargs.get("proxies"):
+                self.stats.proxies.append(dict(request._session_kwargs["proxies"]))
+            try:
+                started_at = anyio.current_time()
+                response = await self.session_manager.fetch(request)
+                latency = anyio.current_time() - started_at
+                self.stats.increment_requests_count(request.sid or self.session_manager.default_session_id)
+                self.stats.increment_response_bytes(request.domain, len(response.body))
+                self.stats.increment_status(response.status)
+
+            except Exception as e:
+                self.stats.failed_requests_count += 1
+                await self.spider.on_error(request, e)
+                return
+
+        if self._cache_manager and request._fp is not None:
+            self.stats.cache_misses += 1
+
+        blocked = await self.spider.is_blocked(response)
+        if self._autothrottle:
+            ok = 200 <= response.status < 300 and not blocked
+            retry_after = None if ok else parse_retry_after(response.headers)
+            self._autothrottle.record(request.domain, latency, ok, floor, retry_after)
+
+        if blocked:
+            self.stats.blocked_requests_count += 1
+            if request._retry_count < self.spider.max_blocked_retries:
+                retry_request = request.copy()
+                retry_request._retry_count += 1
+                retry_request.priority -= 1  # Don't retry immediately
+                retry_request.dont_filter = True
+                retry_request._session_kwargs.pop("proxy", None)
+                retry_request._session_kwargs.pop("proxies", None)
+
+                new_request = await self.spider.retry_blocked_request(retry_request, response)
+                self._normalize_request(new_request)
+                await self.scheduler.enqueue(new_request)
+                log.info(
+                    f"Scheduled blocked request for retry ({retry_request._retry_count}/{self.spider.max_blocked_retries}): {request.url}"
+                )
+            else:
+                log.warning(f"Max retries exceeded for blocked request: {request.url}")
+            return
+
+        if self._cache_manager and request._fp is not None:
+            await self._cache_manager.put(request._fp, response, request._session_kwargs.get("method", "GET"))
+
+        await self._run_callbacks(request, response)
+
     async def _task_wrapper(self, request: Request) -> None:
         """Wrapper to track active task count."""
         try:
             await self._process_request(request)
         finally:
+            self.scheduler.complete(request)
             self._active_tasks -= 1
 
     def request_pause(self) -> None:
@@ -205,7 +320,7 @@ class CrawlerEngine:
         Returns True if successfully restored, False otherwise.
         """
         if not self._checkpoint_system_enabled:
-            raise
+            return False
 
         data = await self._checkpoint_manager.load()
         if data is None:
@@ -219,6 +334,25 @@ class CrawlerEngine:
 
         return True
 
+    async def _prefetch_robots_txt(self) -> None:
+        """Pre-warm the robots.txt cache before the crawl loop starts.
+
+        Extracts unique domains from start_urls, preserving the original scheme.
+        """
+        if not self._robots_manager or not self.spider.start_urls:
+            return
+
+        # Deduplicate by netloc, preserving the scheme from the first URL per domain
+        seen: set[str] = set()
+        seed_urls: list[str] = []
+        for url in self.spider.start_urls:
+            parsed = urlparse(url)
+            if parsed.netloc not in seen:
+                seen.add(parsed.netloc)
+                seed_urls.append(f"{parsed.scheme}://{parsed.netloc}/")
+
+        await self._robots_manager.prefetch(seed_urls, self.session_manager.default_session_id)
+
     async def crawl(self) -> CrawlStats:
         """Run the spider and return CrawlStats."""
         self._running = True
@@ -227,6 +361,11 @@ class CrawlerEngine:
         self._pause_requested = False
         self._force_stop = False
         self.stats = CrawlStats(start_time=anyio.current_time())
+        self._domain_limiters.clear()
+        if self._robots_manager:
+            self._domain_delays.clear()
+        if self._autothrottle:
+            self._autothrottle.reset()
 
         # Check for existing checkpoint
         resuming = (await self._restore_from_checkpoint()) if self._checkpoint_system_enabled else False
@@ -236,8 +375,12 @@ class CrawlerEngine:
             self.stats.concurrent_requests = self.spider.concurrent_requests
             self.stats.concurrent_requests_per_domain = self.spider.concurrent_requests_per_domain
             self.stats.download_delay = self.spider.download_delay
+            self.stats.autothrottle_enabled = self.spider.autothrottle_enabled
             await self.spider.on_start(resuming=resuming)
 
+            await self._prefetch_robots_txt()
+
+            finished = False
             try:
                 if not resuming:
                     async for request in self.spider.start_requests():
@@ -251,17 +394,17 @@ class CrawlerEngine:
                     while self._running:
                         if self._pause_requested:
                             if self._active_tasks == 0 or self._force_stop:
-                                if self._force_stop:
-                                    log.warning(f"Force stopping with {self._active_tasks} active tasks")
-                                    tg.cancel_scope.cancel()
-
-                                # Only save checkpoint if checkpoint system is enabled
+                                # Save checkpoint before canceling to avoid data loss
                                 if self._checkpoint_system_enabled:
                                     await self._save_checkpoint()
                                     self.paused = True
                                     log.info("Spider paused, checkpoint saved")
                                 else:
                                     log.info("Spider stopped gracefully")
+
+                                if self._force_stop:
+                                    log.warning(f"Force stopping with {self._active_tasks} active tasks")
+                                    tg.cancel_scope.cancel()
 
                                 self._running = False
                                 break
@@ -294,11 +437,15 @@ class CrawlerEngine:
                         self._active_tasks += 1
                         tg.start_soon(self._task_wrapper, request)
 
+                finished = True
             finally:
                 await self.spider.on_close()
-                # Clean up checkpoint files on successful completion (not paused)
-                if not self.paused and self._checkpoint_system_enabled:
+                # Clean up checkpoint files only on successful completion (not paused, not crashed)
+                if finished and not self.paused and self._checkpoint_system_enabled:
                     await self._checkpoint_manager.cleanup()
+
+        if self._autothrottle:
+            self.stats.autothrottle_delays = dict(self._autothrottle.delays)
 
         self.stats.log_levels_counter = self.spider._log_counter.get_counts()
         self.stats.end_time = anyio.current_time()

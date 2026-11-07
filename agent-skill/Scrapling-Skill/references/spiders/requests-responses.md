@@ -1,7 +1,5 @@
 # Requests & Responses
 
-This page covers the `Request` object in detail — how to construct requests, pass data between callbacks, control priority and deduplication, and use `response.follow()` for link-following.
-
 ## The Request Object
 
 A `Request` represents a URL to be fetched. You create requests either directly or via `response.follow()`:
@@ -25,7 +23,7 @@ Here are all the arguments you can pass to `Request`:
 | Argument      | Type       | Default    | Description                                                                                           |
 |---------------|------------|------------|-------------------------------------------------------------------------------------------------------|
 | `url`         | `str`      | *required* | The URL to fetch                                                                                      |
-| `sid`         | `str`      | `""`       | Session ID — routes the request to a specific session (see [Sessions](sessions.md))                   |
+| `sid`         | `str`      | `""`       | Session ID - routes the request to a specific session (see [Sessions](sessions.md))                   |
 | `callback`    | `callable` | `None`     | Async generator method to process the response. Defaults to `parse()`                                 |
 | `priority`    | `int`      | `0`        | Higher values are processed first                                                                     |
 | `dont_filter` | `bool`     | `False`    | If `True`, skip deduplication (allow duplicate requests)                                              |
@@ -49,12 +47,12 @@ yield Request(
 
 - **Relative URLs** are resolved automatically against the current page URL
 - **Referer header** is set to the current page URL by default
-- **Session kwargs** from the original request are inherited (headers, proxy settings, etc.)
+- **Session kwargs** from the original request are inherited (headers, proxy settings, etc.), except `method`, `params`, `data`, `json`, `files`, and `multipart`, so followed links are plain GETs
 - **Callback, session ID, and priority** are inherited from the original request if not specified
 
 ```python
 async def parse(self, response: Response):
-    # Minimal — inherits callback, sid, priority from current request
+    # Minimal - inherits callback, sid, priority from current request
     yield response.follow("/next-page")
 
     # Override specific fields
@@ -95,9 +93,9 @@ yield response.follow("/page", referer_flow=False)
 
 Callbacks are async generator methods on your spider that process responses. They must `yield` one of three types:
 
-- **`dict`** — A scraped item, added to the results
-- **`Request`** — A follow-up request, added to the queue
-- **`None`** — Silently ignored
+- **`dict`** - A scraped item, added to the results
+- **`Request`** - A follow-up request, added to the queue
+- **`None`** - Silently ignored
 
 ```python
 class MySpider(Spider):
@@ -116,7 +114,9 @@ class MySpider(Spider):
         yield {"content": response.css("article::text").get("")}
 ```
 
-**Note:** All callback methods must be `async def` and use `yield` (not `return`). Even if a callback only yields items with no follow-up requests, it must still be an async generator.
+**Note:**
+
+All callback methods must be `async def` and use `yield` (not `return`). Even if a callback only yields items with no follow-up requests, it must still be an async generator.
 
 ## Request Priority
 
@@ -124,11 +124,11 @@ Requests with higher priority values are processed first. This is useful when so
 
 ```python
 async def parse(self, response: Response):
-    # High priority — process product pages first
+    # High priority - process product pages first
     for link in response.css("a.product::attr(href)").getall():
         yield response.follow(link, callback=self.parse_product, priority=10)
 
-    # Low priority — pagination links processed after products
+    # Low priority - pagination links processed after products
     next_page = response.css("a.next::attr(href)").get()
     if next_page:
         yield response.follow(next_page, callback=self.parse, priority=0)

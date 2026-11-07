@@ -1,22 +1,51 @@
 import pytest
+from types import SimpleNamespace
+
+from scrapling.fetchers import AsyncStealthySession, StealthySession
 from scrapling.engines._browsers._validators import (
     validate,
+    validate_fetch,
     StealthConfig,
     PlaywrightConfig,
+    RemoteConfig,
 )
 
 
 class TestValidators:
     """Test configuration validators"""
 
+    @pytest.mark.parametrize("model", [PlaywrightConfig, StealthConfig])
+    def test_request_recording_replaces_xhr_config(self, model):
+        config = validate({"record_requests": True, "max_recorded_requests": 50}, model)
+        assert config.record_requests and config.max_recorded_requests == 50
+        assert "capture_xhr" not in model.__struct_fields__
+
+    @pytest.mark.parametrize("model", [PlaywrightConfig, StealthConfig])
+    @pytest.mark.parametrize("value", [None, ".*"])
+    def test_removed_xhr_option_is_rejected_by_config_and_fetch(self, model, value):
+        kwargs = {"capture_xhr": value}
+        message = "capture_xhr was removed; use record_requests=True and session.network."
+        with pytest.raises(TypeError, match=message):
+            validate(kwargs, model)
+        with pytest.raises(TypeError, match=message):
+            validate_fetch(kwargs, SimpleNamespace(_config=model()), model)
+
+    @pytest.mark.parametrize("model", [PlaywrightConfig, StealthConfig])
+    def test_other_unknown_options_keep_existing_behavior(self, model):
+        config = validate({"unknown_option": True}, model)
+        assert not hasattr(config, "unknown_option")
+        params = validate_fetch({"unknown_option": True}, SimpleNamespace(_config=config), model)
+        assert params.timeout == config.timeout
+        assert not hasattr(params, "unknown_option")
+
+    @pytest.mark.parametrize("session_type", [StealthySession, AsyncStealthySession])
+    def test_removed_xhr_option_is_rejected_by_sessions(self, session_type):
+        with pytest.raises(TypeError, match="capture_xhr was removed"):
+            session_type(capture_xhr=".*")
+
     def test_playwright_config_valid(self):
         """Test valid PlaywrightConfig"""
-        params = {
-            "max_pages": 2,
-            "headless": True,
-            "timeout": 30000,
-            "proxy": "http://proxy.example.com:8080"
-        }
+        params = {"max_pages": 2, "headless": True, "timeout": 30000, "proxy": "http://proxy.example.com:8080"}
 
         config = validate(params, PlaywrightConfig)
 
@@ -44,21 +73,29 @@ class TestValidators:
         with pytest.raises(TypeError):
             validate(params, PlaywrightConfig)
 
-    def test_playwright_config_invalid_cdp_url(self):
-        """Test PlaywrightConfig with invalid CDP URL"""
+    def test_remote_config_invalid_cdp_url(self):
         params = {"cdp_url": "invalid-url"}
 
         with pytest.raises(TypeError):
-            validate(params, PlaywrightConfig)
+            validate(params, RemoteConfig)
+
+        for cdp_url in ("ftp://localhost:9222", "localhost:9222", "http://"):
+            with pytest.raises(TypeError):
+                validate({"cdp_url": cdp_url}, RemoteConfig)
+
+    def test_remote_config_cdp_url_schemes(self):
+        for cdp_url in (
+            "ws://localhost:9222",
+            "wss://cdp.example.com/session",
+            "http://localhost:9222",
+            "https://cdp.example.com",
+        ):
+            config = validate({"cdp_url": cdp_url}, RemoteConfig)
+            assert isinstance(config, RemoteConfig) and config.cdp_url == cdp_url
 
     def test_stealth_config_valid(self):
         """Test valid StealthConfig"""
-        params = {
-            "max_pages": 1,
-            "headless": True,
-            "solve_cloudflare": False,
-            "timeout": 30000
-        }
+        params = {"max_pages": 1, "headless": True, "solve_cloudflare": False, "timeout": 30000}
 
         config = validate(params, StealthConfig)
 
@@ -71,7 +108,7 @@ class TestValidators:
         """Test StealthConfig timeout adjustment for Cloudflare"""
         params = {
             "solve_cloudflare": True,
-            "timeout": 10000  # Less than the required 60,000
+            "timeout": 10000,  # Less than the required 60,000
         }
 
         config = validate(params, StealthConfig)

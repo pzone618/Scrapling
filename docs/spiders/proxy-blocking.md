@@ -1,3 +1,8 @@
+---
+title: "Rotate Proxies and Retry Blocked Crawl Requests"
+description: "Use proxies and rotation strategies in Scrapling spiders. Detect blocked responses, retry requests and switch from HTTP to browser sessions."
+---
+
 # Proxy management and handling Blocks
 
 ## Introduction
@@ -7,7 +12,7 @@
     1. You've read the [Getting started](getting-started.md) page and know how to create and run a basic spider.
     2. You've read the [Sessions](sessions.md) page and understand how to configure sessions.
 
-When scraping at scale, you'll often need to rotate through multiple proxies to avoid rate limits and blocks. Scrapling's `ProxyRotator` makes this straightforward — it works with all session types and integrates with the spider's blocked request retry system.
+When scraping at scale, you'll often need to rotate through multiple proxies to avoid rate limits and blocks. Scrapling's `ProxyRotator` makes this straightforward. It works with all session types and integrates with the spider's blocked request retry system.
 
 If you don't know what a proxy is or how to choose a good one, [this guide can help](https://substack.thewebscraping.club/p/everything-about-proxies).
 
@@ -43,7 +48,7 @@ Each request automatically gets the next proxy in the rotation. The proxy used i
 When you use it with browser sessions, you will need some adjustments, like below:
 
 ```python
-from scrapling.fetchers import AsyncDynamicSession, AsyncStealthySession, ProxyRotator
+from scrapling.fetchers import AsyncStealthySession, ProxyRotator
 
 # String proxies work for all session types
 rotator = ProxyRotator([
@@ -70,7 +75,7 @@ def configure_sessions(self, manager):
 
 ## Custom Rotation Strategies
 
-By default, `ProxyRotator` uses cyclic rotation — it iterates through proxies sequentially, wrapping around at the end.
+By default, `ProxyRotator` uses cyclic rotation, iterating through proxies sequentially and wrapping around at the end.
 
 You can provide a custom strategy function to change this behavior, but it has to match the below signature:
 

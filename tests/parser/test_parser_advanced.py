@@ -67,7 +67,6 @@ class TestAdvancedSelectors:
                     <p>First paragraph</p>
                     <!-- Comment -->
                     <p>Second paragraph</p>
-                    <![CDATA[Some CDATA content]]>
                     <div class="nested">
                         <span id="special">Special content</span>
                         <span>Regular content</span>
@@ -81,24 +80,13 @@ class TestAdvancedSelectors:
         </html>
         """
 
-    def test_comment_and_cdata_handling(self, complex_html):
-        """Test handling of comments and CDATA"""
-        # With comments/CDATA kept
-        page = Selector(
-            complex_html,
-            keep_comments=True,
-            keep_cdata=True
-        )
-        content = page.body
+    def test_comment_handling(self, complex_html):
+        """Test handling of comments"""
+        page = Selector(complex_html, keep_comments=True)
+        content = page.html_content
         assert "Comment" in content
-        assert "CDATA" in content
 
-        # Without comments/CDATA
-        page = Selector(
-            complex_html,
-            keep_comments=False,
-            keep_cdata=False
-        )
+        page = Selector(complex_html, keep_comments=False)
         content = page.html_content
         assert "Comment" not in content
 
@@ -210,6 +198,23 @@ class TestAdvancedSelectors:
 
         assert node.get_all_text("\n", strip=True) == "string1\nstring2\nstring3\nstring4\nstring5\nstring6\nstring7"
 
+    def test_get_all_text_keeps_text_after_comment(self):
+        """Tail text following a comment or PI node must still be collected"""
+        html = "<div>before<!-- c -->after<p>x</p></div>"
+        assert Selector(html, keep_comments=True).get_all_text() == "before\nafter\nx"
+
+    def test_get_all_text_deep_nesting(self):
+        """Deeply nested trees collect every visible text node and skip ignored subtrees"""
+        depth = 500
+        html = "<div>" + "".join(f"<span>t{i}" for i in range(depth)) + "leaf" + "</span>" * depth + "end</div>"
+        text = Selector(html).get_all_text(strip=True)
+        assert text.startswith("t0\nt1\n")
+        assert "leaf" in text and text.endswith("end")
+        assert text.count("\n") == depth
+
+        ignored = "<div>keep<script>" + "<b>x</b>" * depth + "</script>done</div>"
+        assert Selector(ignored).get_all_text(strip=True) == "keep\ndone"
+
 
 class TestTextHandlerAdvanced:
     """Test advanced TextHandler functionality"""
@@ -250,6 +255,68 @@ class TestTextHandlerAdvanced:
         matches = text3.re(r"He l lo", clean_match=True, case_sensitive=False)
         assert len(matches) == 1
 
+    def test_text_handler_regex_check_match(self):
+        """Test TextHandler.re() with check_match=True returns bool"""
+        text = TextHandler("Price: $10.99")
+        assert text.re(r"\$[\d.]+", check_match=True) is True
+        assert text.re(r"no-match-pattern", check_match=True) is False
+
+    def test_text_handler_regex_replace_entities_false(self):
+        """Test TextHandler.re() with replace_entities=False preserves entities"""
+        text = TextHandler("Hello &amp; World")
+        results = text.re(r"&amp;", replace_entities=False)
+        assert len(results) == 1
+        assert results[0] == "&amp;"
+
+    def test_text_handler_regex_with_groups(self):
+        """Test TextHandler.re() with capture groups flattens results"""
+        text = TextHandler("name=Alice age=30 name=Bob age=25")
+        results = text.re(r"name=(\w+) age=(\d+)")
+        assert len(results) == 4
+        assert "Alice" in results
+        assert "30" in results
+
+    def test_text_handler_re_first_with_default(self):
+        """Test TextHandler.re_first() returns default when no match"""
+        text = TextHandler("no numbers here")
+        result = text.re_first(r"\d+", default="N/A")
+        assert result == "N/A"
+
+    def test_text_handler_re_first_returns_first_match(self):
+        """Test TextHandler.re_first() returns first match"""
+        text = TextHandler("a1 b2 c3")
+        result = text.re_first(r"\d")
+        assert result == "1"
+        assert isinstance(result, TextHandler)
+
+    def test_text_handler_clean_with_entities(self):
+        """Test TextHandler.clean() with remove_entities=True"""
+        text = TextHandler("Hello\t&amp;\nWorld")
+        cleaned = text.clean(remove_entities=True)
+        assert "&amp;" not in cleaned
+        assert "&" in cleaned
+        assert "\t" not in cleaned
+        assert "\n" not in cleaned
+
+    def test_text_handler_clean_without_entities(self):
+        """Test TextHandler.clean() preserves entities by default"""
+        text = TextHandler("Hello\t&amp;\nWorld")
+        cleaned = text.clean(remove_entities=False)
+        assert "&amp;" in cleaned
+
+    def test_text_handler_json_valid(self):
+        """Test TextHandler.json() with valid JSON"""
+        text = TextHandler('{"key": "value", "num": 42}')
+        data = text.json()
+        assert data["key"] == "value"
+        assert data["num"] == 42
+
+    def test_text_handler_json_invalid(self):
+        """Test TextHandler.json() raises on invalid JSON"""
+        text = TextHandler("not json")
+        with pytest.raises(Exception):
+            text.json()
+
     def test_text_handlers_operations(self):
         """Test TextHandlers list operations"""
         handlers = TextHandlers([
@@ -265,6 +332,37 @@ class TestTextHandlerAdvanced:
         assert handlers.get() == "First"
         assert handlers.get("default") == "First"
         assert TextHandlers([]).get("default") == "default"
+
+    def test_text_handlers_re(self):
+        """Test TextHandlers.re() flattens results across all elements"""
+        handlers = TextHandlers([
+            TextHandler("a1 b2"),
+            TextHandler("c3 d4"),
+        ])
+        results = handlers.re(r"[a-z]\d")
+        assert isinstance(results, TextHandlers)
+        assert len(results) == 4
+        assert results[0] == "a1"
+        assert results[3] == "d4"
+
+    def test_text_handlers_re_empty(self):
+        """Test TextHandlers.re() on empty list"""
+        handlers = TextHandlers([])
+        results = handlers.re(r"\d+")
+        assert isinstance(results, TextHandlers)
+        assert len(results) == 0
+
+    def test_text_handlers_re_no_matches(self):
+        """Test TextHandlers.re() when no element matches"""
+        handlers = TextHandlers([TextHandler("abc"), TextHandler("def")])
+        results = handlers.re(r"\d+")
+        assert len(results) == 0
+
+    def test_text_handlers_extract(self):
+        """Test TextHandlers.extract() returns self"""
+        handlers = TextHandlers([TextHandler("a"), TextHandler("b")])
+        assert handlers.extract() is handlers
+        assert handlers.getall() is handlers
 
 
 class TestSelectorsAdvanced:

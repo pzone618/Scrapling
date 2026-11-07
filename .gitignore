@@ -1,125 +1,180 @@
-# local files
+
+# ============================================================
+# Local / project-specific
+# ============================================================
 site/*
 local_tests/*
 .mcpregistry_*
+tasks/*
+/tasks
+
+# Script outputs (keep the folder itself)
 output/*
 !output/.gitkeep
 
-# macOS
-.DS_Store
-._*
-.AppleDouble
-.LSOverride
-Icon
+# Runtime marker created by `scrapling install`
+scrapling/.scrapling_dependencies_installed
 
-# AI / IDE related files
+# Scrapling adaptive-storage / crawl artefacts
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+crawldata/
+checkpoints/
+.scrapling_cache/
+
+# ============================================================
+# AI assistants / IDEs / editors
+# ============================================================
 .claude/
 CLAUDE.md
+CLAUDE.local.md
+.mcp.json
 .cursor/
 .cursorrules
 .windsurf/
+.windsurfrules
 .zed/
+.aider*
+.continue/
+.codex/
+AGENTS.local.md
 
-# cached files
-__pycache__/
-*.py[cod]
-.cache
+# JetBrains
+.idea/
+*.iml
+
+# VS Code (keep shared settings opt-in)
+.vscode/*
+!.vscode/extensions.json
+*.code-workspace
+.history/
+
+# Other IDEs / editors
+.project
+.pydevproject
+.settings/
+*.komodoproject
 *~
 .*.sw[po]
-.build
-.ve
-.env
-.pytest
-.benchmarks
-.bootstrap
-.appveyor.token
-*.bak
-*.db
-*.db-*
+*.swp
+\#*\#
+.\#*
 
-# installation package
-*.egg-info/
-dist/
+# ============================================================
+# Operating systems
+# ============================================================
+# macOS (incl. AppleDouble files created on external/exFAT drives)
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.DocumentRevisions-V100
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build
 build/
+dist/
+sdist/
+wheelhouse/
+develop-eggs/
+eggs/
+.eggs/
+*.egg
+*.egg-info/
+.installed.cfg
+pip-wheel-metadata/
+MANIFEST
 
-# environments
-.venv
+# Virtual environments
+.venv*/
+venv*/
 env/
-venv/
 ENV/
 env.bak/
 venv.bak/
-
-# uv - only ignore python version file, keep uv.lock for reproducibility
+pyvenv*/
 .python-version
 
-# C extensions
-*.so
-
-# pycharm
-.idea/
-
-# vscode
-*.code-workspace
-
-# Packages
-*.egg
-*.egg-info
-dist
-build
-eggs
-.eggs
-parts
-bin
-var
-sdist
-wheelhouse
-develop-eggs
-.installed.cfg
-lib
-lib64
-venv*/
-.venv*/
-pyvenv*/
-pip-wheel-metadata/
+# uv: keep uv.lock for reproducibility; poetry is not used
 poetry.lock
 
 # Installer logs
 pip-log.txt
+pip-delete-this-directory.txt
 
-# mypy
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ============================================================
+# Tests / quality tools
+# ============================================================
+.tox/
+.nox/
+.pytest_cache/
+.pytest
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+report.xml
+nosetests.xml
+.benchmarks
+.hypothesis/
 .mypy_cache/
 .dmypy.json
 dmypy.json
-mypy.ini
+.pyre/
+.pytype/
+.ruff_cache/
 
-# test caches
-.tox/
-.pytest_cache/
-.coverage
-htmlcov
-report.xml
-nosetests.xml
-coverage.xml
+# ============================================================
+# Browsers / Playwright artefacts
+# ============================================================
+test-results/
+playwright-report/
+playwright/.cache/
+*.har
+*.trace.zip
 
-# Translations
+# ============================================================
+# Docs / misc
+# ============================================================
+docs/_build/
+.cache
 *.mo
-
-# Buildout
+*.bak
+*.log
 .mr.developer.cfg
-
-# IDE project files
-.project
-.pydevproject
-.idea
-*.iml
-*.komodoproject
-
-# Complexity
-output/*.html
-output/*/index.html
-
-# Sphinx
-docs/_build
-public/
-web/
+.build
+.ve
+.bootstrap
+.appveyor.token
+node_modules/

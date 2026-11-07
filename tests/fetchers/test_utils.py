@@ -1,14 +1,22 @@
+import re
+
 import pytest
 
+from scrapling.engines.toolbelt.convertor import ResponseFactory
 from scrapling.engines.toolbelt.custom import StatusText, Response
 from scrapling.engines.toolbelt.navigation import (
     construct_proxy_dict,
     create_intercept_handler,
     create_async_intercept_handler,
+    _is_domain_blocked,
 )
+from browserforge.headers.generator import SUPPORTED_OPERATING_SYSTEMS
+
+from scrapling.engines.toolbelt import fingerprints
 from scrapling.engines.toolbelt.fingerprints import (
     get_os_name,
-    generate_headers
+    generate_headers,
+    driven_browser_version,
 )
 
 
@@ -141,6 +149,48 @@ def test_unknown_status_code():
     assert StatusText.get(1000) == "Unknown Status Code"
 
 
+def test_browser_encoding_unquoted_charset():
+    """A charset declared without quotes is returned verbatim."""
+    assert ResponseFactory._extract_encoding("text/html; charset=utf-8") == "utf-8"
+    assert ResponseFactory._extract_encoding("text/html; charset=ISO-8859-1") == "ISO-8859-1"
+    assert ResponseFactory._extract_encoding("text/html;charset=windows-1252") == "windows-1252"
+
+
+def test_browser_encoding_quoted_charset():
+    """A quoted charset value (RFC 7231 allows quoting) is unwrapped, not dropped."""
+    assert ResponseFactory._extract_encoding('text/html; charset="utf-8"') == "utf-8"
+    assert ResponseFactory._extract_encoding('text/html; charset="ISO-8859-1"') == "ISO-8859-1"
+    assert ResponseFactory._extract_encoding("text/html; charset='Shift_JIS'") == "Shift_JIS"
+    assert ResponseFactory._extract_encoding('text/plain; charset="windows-1252"; boundary=x') == "windows-1252"
+
+
+def test_browser_encoding_defaults_when_missing():
+    """Fall back to the default when no charset is present or the header is empty."""
+    assert ResponseFactory._extract_encoding("text/html") == "utf-8"
+    assert ResponseFactory._extract_encoding("") == "utf-8"
+    assert ResponseFactory._extract_encoding(None) == "utf-8"
+
+
+@pytest.mark.parametrize(
+    "header, expected",
+    [
+        ('text/plain; CHARSET = "ISO-8859-1"', "ISO-8859-1"),
+        ("text/plain; charset = utf-16", "utf-16"),
+        ('text/plain; charset=""', "utf-8"),
+        ('text/plain; note="charset=utf-16"', "utf-8"),
+        ("text/plain; x-charset=utf-16", "utf-8"),
+        ("text/plain; charset*=utf-8''UTF-16", "UTF-16"),
+    ],
+)
+def test_browser_encoding_header_parameters(header, expected):
+    assert ResponseFactory._extract_encoding(header) == expected
+
+
+def test_browser_encoding_custom_default():
+    assert ResponseFactory._extract_encoding(None, "ISO-8859-1") == "ISO-8859-1"
+    assert ResponseFactory._extract_encoding('text/plain; charset=""', "ISO-8859-1") == "ISO-8859-1"
+
+
 class TestConstructProxyDict:
     """Test proxy dictionary construction"""
 
@@ -148,31 +198,26 @@ class TestConstructProxyDict:
         """Test a basic proxy string"""
         result = construct_proxy_dict("http://proxy.example.com:8080")
 
-        expected = {
-            "server": "http://proxy.example.com:8080",
-            "username": "",
-            "password": ""
-        }
+        expected = {"server": "http://proxy.example.com:8080", "username": "", "password": ""}
         assert result == expected
 
     def test_proxy_string_with_auth(self):
         """Test proxy string with authentication"""
         result = construct_proxy_dict("http://user:pass@proxy.example.com:8080")
 
-        expected = {
-            "server": "http://proxy.example.com:8080",
-            "username": "user",
-            "password": "pass"
-        }
+        expected = {"server": "http://proxy.example.com:8080", "username": "user", "password": "pass"}
+        assert result == expected
+
+    def test_proxy_string_with_percent_encoded_auth(self):
+        """Test proxy string with percent-encoded credentials"""
+        result = construct_proxy_dict("http://user%40mail.com:p%40ss%3Aw0rd%2F@proxy.example.com:8080")
+
+        expected = {"server": "http://proxy.example.com:8080", "username": "user@mail.com", "password": "p@ss:w0rd/"}
         assert result == expected
 
     def test_proxy_dict_input(self):
         """Test proxy dictionary input"""
-        input_dict = {
-            "server": "http://proxy.example.com:8080",
-            "username": "user",
-            "password": "pass"
-        }
+        input_dict = {"server": "http://proxy.example.com:8080", "username": "user", "password": "pass"}
         result = construct_proxy_dict(input_dict)
 
         assert result == input_dict
@@ -182,11 +227,7 @@ class TestConstructProxyDict:
         input_dict = {"server": "http://proxy.example.com:8080"}
         result = construct_proxy_dict(input_dict)
 
-        expected = {
-            "server": "http://proxy.example.com:8080",
-            "username": "",
-            "password": ""
-        }
+        expected = {"server": "http://proxy.example.com:8080", "username": "", "password": ""}
         assert result == expected
 
     def test_invalid_proxy_string(self):
@@ -207,9 +248,7 @@ class TestFingerprintFunctions:
         """Test OS name detection"""
         result = get_os_name()
 
-        # Should return one of the known OS names or None
-        valid_names = ["linux", "macos", "windows", "ios"]
-        assert result is None or result in valid_names
+        assert result in SUPPORTED_OPERATING_SYSTEMS or result == SUPPORTED_OPERATING_SYSTEMS
 
     def test_generate_headers_basic(self):
         """Test basic header generation"""
@@ -226,6 +265,65 @@ class TestFingerprintFunctions:
         assert isinstance(headers, dict)
         assert "User-Agent" in headers
 
+    def test_driven_browser_version(self):
+        """Test that the driven Chromium version is read from the installed automation package"""
+        assert isinstance(driven_browser_version(), int)
+        assert driven_browser_version("not_a_real_package") is None
+
+    @pytest.mark.parametrize("browser_mode", [True, "chrome"])
+    def test_browser_useragent_follows_the_driven_browser(self, monkeypatch, browser_mode):
+        """Test that both browser-facing User-Agents track the real driven version, not the fingerprints data"""
+        monkeypatch.setattr(fingerprints, "get_os_name", lambda: "macos")
+        # A version far above anything the fingerprints data ships, to prove the data no longer caps it
+        monkeypatch.setattr(fingerprints, "driven_browser_version", lambda *args: 999)
+
+        assert "Chrome/999.0.0.0" in generate_headers(browser_mode=browser_mode)["User-Agent"]
+
+    def test_http_mode_useragent_is_not_rewritten(self, monkeypatch):
+        """Test that the HTTP-mode User-Agent keeps its fingerprints version since it isn't fed to a browser"""
+        monkeypatch.setattr(fingerprints, "get_os_name", lambda: "macos")
+        monkeypatch.setattr(fingerprints, "driven_browser_version", lambda *args: 999)
+
+        assert "999" not in generate_headers(browser_mode=False)["User-Agent"]
+
+    def test_browser_mode_useragent_falls_back_without_a_driven_version(self, monkeypatch):
+        """Test that the User-Agent still generates on the minimum version when the driven version can't be read"""
+        monkeypatch.setattr(fingerprints, "get_os_name", lambda: "macos")
+        monkeypatch.setattr(fingerprints, "driven_browser_version", lambda *args: None)
+
+        major = int(re.search(r"Chrome/(\d+)", generate_headers(browser_mode=True)["User-Agent"]).group(1))
+        assert major >= fingerprints.MINIMUM_VERSION
+
+    def test_generate_headers_survives_unavailable_minimum(self, monkeypatch):
+        """Test that generation falls back instead of crashing when the data has nothing at or above the minimum"""
+        monkeypatch.setattr(fingerprints, "get_os_name", lambda: "macos")
+        monkeypatch.setattr(fingerprints, "MINIMUM_VERSION", 9999)
+
+        assert "Chrome/" in generate_headers(browser_mode=True)["User-Agent"]
+
+    @pytest.mark.parametrize("os_name", ["linux", "macos", "windows"])
+    def test_generate_headers_desktop_os_stays_desktop(self, monkeypatch, os_name):
+        """Test that desktop OSes never get a mobile User-Agent"""
+        monkeypatch.setattr(fingerprints, "get_os_name", lambda: os_name)
+        useragent = generate_headers(browser_mode=True)["User-Agent"]
+
+        assert "Android" not in useragent
+        assert "Mobile" not in useragent
+
+    def test_generate_headers_android_is_mobile(self, monkeypatch):
+        """Test that Android hosts get a mobile User-Agent instead of a desktop one"""
+        monkeypatch.setattr(fingerprints, "get_os_name", lambda: "android")
+
+        for browser_mode in (False, True, "chrome"):
+            assert "Android" in generate_headers(browser_mode=browser_mode)["User-Agent"]
+
+    def test_generate_headers_unknown_os(self, monkeypatch):
+        """Test that header generation still works when the OS can't be detected"""
+        monkeypatch.setattr(fingerprints, "get_os_name", lambda: SUPPORTED_OPERATING_SYSTEMS)
+        headers = generate_headers(browser_mode=True)
+
+        assert len(headers["User-Agent"]) > 0
+
 
 class TestResponse:
     """Test Response class functionality"""
@@ -240,7 +338,7 @@ class TestResponse:
             cookies={"session": "abc123"},
             headers={"Content-Type": "text/html"},
             request_headers={"User-Agent": "Test"},
-            encoding="utf-8"
+            encoding="utf-8",
         )
 
         assert response.url == "https://example.com"
@@ -250,7 +348,7 @@ class TestResponse:
 
     def test_response_with_bytes_content(self):
         """Test Response with 'bytes' content"""
-        content_bytes = "<html><body>Test</body></html>".encode('utf-8')
+        content_bytes = "<html><body>Test</body></html>".encode("utf-8")
 
         response = Response(
             url="https://example.com",
@@ -259,7 +357,7 @@ class TestResponse:
             reason="OK",
             cookies={},
             headers={},
-            request_headers={}
+            request_headers={},
         )
 
         # Should handle 'bytes' content properly
@@ -268,6 +366,7 @@ class TestResponse:
 
 class _MockRequest:
     """Minimal mock for Playwright's Request object."""
+
     def __init__(self, url: str, resource_type: str = "document"):
         self.url = url
         self.resource_type = resource_type
@@ -275,6 +374,7 @@ class _MockRequest:
 
 class _MockRoute:
     """Minimal mock for Playwright's sync Route object."""
+
     def __init__(self, url: str, resource_type: str = "document"):
         self.request = _MockRequest(url, resource_type)
         self.aborted = False
@@ -289,6 +389,7 @@ class _MockRoute:
 
 class _AsyncMockRoute:
     """Minimal mock for Playwright's async Route object."""
+
     def __init__(self, url: str, resource_type: str = "document"):
         self.request = _MockRequest(url, resource_type)
         self.aborted = False
@@ -411,3 +512,90 @@ class TestCreateAsyncInterceptHandler:
         route = _AsyncMockRoute("https://notexample.com/page")
         await handler(route)
         assert route.continued
+
+
+class TestIsDomainBlocked:
+    """Test the frozenset-based domain matching helper."""
+
+    def test_exact_match(self):
+        domains = frozenset({"doubleclick.net"})
+        assert _is_domain_blocked("doubleclick.net", domains) is True
+
+    def test_subdomain_match(self):
+        domains = frozenset({"doubleclick.net"})
+        assert _is_domain_blocked("ads.doubleclick.net", domains) is True
+
+    def test_deep_subdomain_match(self):
+        domains = frozenset({"doubleclick.net"})
+        assert _is_domain_blocked("tracker.ads.doubleclick.net", domains) is True
+
+    def test_no_partial_match(self):
+        domains = frozenset({"doubleclick.net"})
+        assert _is_domain_blocked("notdoubleclick.net", domains) is False
+
+    def test_no_match(self):
+        domains = frozenset({"doubleclick.net"})
+        assert _is_domain_blocked("example.com", domains) is False
+
+    def test_empty_domains(self):
+        assert _is_domain_blocked("example.com", frozenset()) is False
+
+    def test_multiple_domains(self):
+        domains = frozenset({"ads.com", "tracker.io", "doubleclick.net"})
+        assert _is_domain_blocked("cdn.ads.com", domains) is True
+        assert _is_domain_blocked("tracker.io", domains) is True
+        assert _is_domain_blocked("safe.example.com", domains) is False
+
+
+class TestAdDomains:
+    """Test the built-in ad domain list."""
+
+    def test_ad_domains_is_frozenset(self):
+        from scrapling.engines.toolbelt.ad_domains import AD_DOMAINS
+
+        assert isinstance(AD_DOMAINS, frozenset)
+
+    def test_ad_domains_has_entries(self):
+        from scrapling.engines.toolbelt.ad_domains import AD_DOMAINS
+
+        assert len(AD_DOMAINS) > 1000
+
+    def test_ad_domains_contains_known_entries(self):
+        from scrapling.engines.toolbelt.ad_domains import AD_DOMAINS
+
+        assert "doubleclick.net" in AD_DOMAINS
+        assert "googlesyndication.com" in AD_DOMAINS
+
+
+class TestBlockAdsConfig:
+    """Test that block_ads merges ad domains into blocked_domains at config level."""
+
+    def test_block_ads_populates_blocked_domains(self):
+        from scrapling.engines._browsers._validators import PlaywrightConfig
+
+        config = PlaywrightConfig(block_ads=True)
+        assert config.blocked_domains is not None
+        assert len(config.blocked_domains) > 1000
+        assert "doubleclick.net" in config.blocked_domains
+
+    def test_block_ads_false_leaves_blocked_domains_none(self):
+        from scrapling.engines._browsers._validators import PlaywrightConfig
+
+        config = PlaywrightConfig(block_ads=False)
+        assert config.blocked_domains is None
+
+    def test_block_ads_merges_with_user_domains(self):
+        from scrapling.engines._browsers._validators import PlaywrightConfig
+
+        user_domains = {"my-custom-block.com"}
+        config = PlaywrightConfig(block_ads=True, blocked_domains=user_domains)
+        assert config.blocked_domains is not None
+        assert "my-custom-block.com" in config.blocked_domains
+        assert "doubleclick.net" in config.blocked_domains
+
+    def test_block_ads_does_not_modify_original_set(self):
+        from scrapling.engines._browsers._validators import PlaywrightConfig
+
+        user_domains = {"my-custom-block.com"}
+        _ = PlaywrightConfig(block_ads=True, blocked_domains=user_domains)
+        assert len(user_domains) == 1

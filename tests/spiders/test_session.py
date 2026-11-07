@@ -1,9 +1,12 @@
 """Tests for the SessionManager class."""
 
+from unittest.mock import AsyncMock, PropertyMock
+
 from scrapling.core._types import Any
 import pytest
 
 from scrapling.spiders.session import SessionManager
+from scrapling.spiders.request import Request
 
 
 class MockSession:  # type: ignore[type-arg]
@@ -350,3 +353,122 @@ class TestSessionManagerIntegration:
         # After close - all inactive
         await manager.close()
         assert all(not s._is_alive for s in sessions)
+
+
+class TestSessionManagerFetch:
+    """Test SessionManager fetch behavior."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_preserves_request_method(self):
+        """Test that fetch does not mutate request._session_kwargs.
+
+        Previously, fetch() used pop("method") which removed the method
+        key from the original request dict. This caused retried requests
+        (via request.copy()) to lose their HTTP method and fall back to GET.
+        """
+        from scrapling.engines.static import _ASyncSessionLogic
+        from scrapling.fetchers import FetcherSession
+        from scrapling.engines.toolbelt.custom import Response
+
+        mock_response = Response(
+            url="https://example.com",
+            content=b"ok",
+            status=200,
+            reason="OK",
+            cookies={},
+            headers={"content-type": "text/html"},
+            request_headers={},
+        )
+        mock_response.meta = {}
+
+        mock_client = AsyncMock(spec=_ASyncSessionLogic)
+        mock_client._make_request = AsyncMock(return_value=mock_response)
+
+        mock_session = AsyncMock(spec=FetcherSession)
+        mock_session._client = mock_client
+        mock_session._is_alive = True
+
+        manager = SessionManager()
+        manager._sessions["default"] = mock_session
+        manager._default_session_id = "default"
+        manager._started = True
+
+        request = Request("https://example.com", method="POST", data={"key": "value"})
+
+        assert request._session_kwargs["method"] == "POST"
+
+        await manager.fetch(request)
+
+        # method must still be present after fetch
+        assert "method" in request._session_kwargs
+        assert request._session_kwargs["method"] == "POST"
+
+        # verify the correct method was passed to _make_request
+        mock_client._make_request.assert_called_once()
+        call_kwargs = mock_client._make_request.call_args
+        assert call_kwargs.kwargs["method"] == "POST"
+
+    @staticmethod
+    def _manager_with_mock_client():
+        """Build a SessionManager whose default FetcherSession records `_make_request` calls."""
+        from scrapling.engines.static import _ASyncSessionLogic
+        from scrapling.fetchers import FetcherSession
+        from scrapling.engines.toolbelt.custom import Response
+
+        mock_response = Response(
+            url="https://example.com",
+            content=b"ok",
+            status=200,
+            reason="OK",
+            cookies={},
+            headers={"content-type": "text/html"},
+            request_headers={},
+        )
+        mock_response.meta = {}
+
+        mock_client = AsyncMock(spec=_ASyncSessionLogic)
+        mock_client._make_request = AsyncMock(return_value=mock_response)
+
+        mock_session = AsyncMock(spec=FetcherSession)
+        mock_session._client = mock_client
+        mock_session._is_alive = True
+
+        manager = SessionManager()
+        manager._sessions["default"] = mock_session
+        manager._default_session_id = "default"
+        manager._started = True
+        return manager, mock_client
+
+    @pytest.mark.asyncio
+    async def test_fetch_passes_stealthy_headers_as_stealth(self):
+        """`stealthy_headers` is mapped to `stealth` like the public session methods do, not sent to curl_cffi."""
+        manager, mock_client = self._manager_with_mock_client()
+        request = Request("https://example.com", stealthy_headers=False)
+
+        await manager.fetch(request)
+
+        call_kwargs = mock_client._make_request.call_args.kwargs
+        assert call_kwargs["stealth"] is False
+        assert "stealthy_headers" not in call_kwargs
+        # The request keeps its kwargs, so retries and copies still carry the setting
+        assert request._session_kwargs["stealthy_headers"] is False
+
+    @pytest.mark.asyncio
+    async def test_fetch_still_accepts_stealth(self):
+        """Passing the internal `stealth` name directly keeps working."""
+        manager, mock_client = self._manager_with_mock_client()
+
+        await manager.fetch(Request("https://example.com", stealth=False))
+
+        assert mock_client._make_request.call_args.kwargs["stealth"] is False
+
+    @pytest.mark.asyncio
+    async def test_fetch_without_stealthy_headers_uses_session_default(self):
+        """Without either name, nothing is passed and the session falls back to its own setting."""
+        manager, mock_client = self._manager_with_mock_client()
+
+        await manager.fetch(Request("https://example.com"))
+
+        call_kwargs = mock_client._make_request.call_args.kwargs
+        assert "stealth" not in call_kwargs
+        assert "stealthy_headers" not in call_kwargs

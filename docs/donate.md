@@ -1,3 +1,10 @@
+---
+title: "Support Scrapling and Sponsor Its Development"
+description: "Support Scrapling through GitHub Sponsors or Buy Me a Coffee. See the advertising tiers and benefits for project sponsors."
+---
+
+# Support and Advertisement
+
 I've been creating all of these projects in my spare time and have invested considerable resources & effort in providing them to the community for free. By becoming a sponsor, you'd be directly funding my coffee reserves, helping me fulfill my responsibilities, and enabling me to continuously update existing projects and potentially create new ones.
 
 You can sponsor me directly through the [GitHub Sponsors program](https://github.com/sponsors/D4Vinci) or [Buy Me a Coffee](https://buymeacoffee.com/d4vinci).
@@ -23,7 +30,7 @@ Perks:
 ### 3. [The Platinum tier](https://github.com/sponsors/D4Vinci/sponsorships?tier_id=586646) ($300/month)
 Perks:
 
-1. Your logo will have a special placement at [the very top of Scrapling's project page](https://github.com/D4Vinci/Scrapling?tab=readme-ov-file#platinum-sponsors) with a 35-word paragraph or less.
+1. Your logo will have a special placement at [the very top of Scrapling's project page](https://github.com/D4Vinci/Scrapling?tab=readme-ov-file#platinum-sponsors) with a 25-word paragraph or less.
 2. The same logo will be featured at [the PyPI page](https://pypi.org/project/scrapling/)/[the Docker page](https://hub.docker.com/r/pyd4vinci/scrapling), the same way it was placed on the project's page.
 3. A special placement for your logo as a top sponsor on [Scrapling's website](https://scrapling.readthedocs.io/en/latest/) main page.
 4. A partner role at our Discord server and an announcement on the Twitter page and the Discord server.

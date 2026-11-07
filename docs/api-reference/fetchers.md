@@ -1,6 +1,6 @@
 ---
-search:
-  exclude: true
+title: "HTTP and Browser Fetchers API Reference"
+description: "Look up Fetcher, AsyncFetcher, StealthyFetcher and session APIs. Check request options, browser settings and return types."
 ---
 
 # Fetchers Classes
@@ -11,8 +11,9 @@ You can import all of them directly like below:
 
 ```python
 from scrapling.fetchers import (
-    Fetcher, AsyncFetcher, StealthyFetcher, DynamicFetcher,
-    FetcherSession, AsyncStealthySession, StealthySession, DynamicSession, AsyncDynamicSession
+    Fetcher, AsyncFetcher, StealthyFetcher,
+    FetcherSession, AsyncStealthySession, StealthySession,
+    RemoteSession, AsyncRemoteSession
 )
 ```
 
@@ -21,10 +22,6 @@ from scrapling.fetchers import (
     :docstring:
 
 ## ::: scrapling.fetchers.AsyncFetcher
-    handler: python
-    :docstring:
-
-## ::: scrapling.fetchers.DynamicFetcher
     handler: python
     :docstring:
 
@@ -51,13 +48,12 @@ from scrapling.fetchers import (
     handler: python
     :docstring:
 
-### Dynamic Sessions
+### Remote Sessions {#remote-sessions}
 
-## ::: scrapling.fetchers.DynamicSession
+## ::: scrapling.fetchers.RemoteSession
     handler: python
     :docstring:
 
-## ::: scrapling.fetchers.AsyncDynamicSession
+## ::: scrapling.fetchers.AsyncRemoteSession
     handler: python
     :docstring:
-

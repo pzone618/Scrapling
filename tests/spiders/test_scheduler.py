@@ -1,5 +1,7 @@
 """Tests for the Scheduler class."""
 
+import pickle
+
 import pytest
 
 from scrapling.spiders.request import Request
@@ -16,6 +18,61 @@ class TestSchedulerInit:
 
         assert len(scheduler) == 0
         assert scheduler.is_empty is True
+
+    @pytest.mark.parametrize("strategy", ["", "BFS", "random", None])
+    def test_invalid_crawl_strategy(self, strategy):
+        with pytest.raises(ValueError, match="crawl_strategy must be 'bfs' or 'dfs'"):
+            Scheduler(crawl_strategy=strategy)
+
+
+class TestSchedulerOrder:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("strategy, order", [("bfs", [0, 1, 4, 3]), ("dfs", [4, 1, 0, 3])])
+    async def test_arrival_order_preserves_priorities(self, strategy, order):
+        scheduler = Scheduler(crawl_strategy=strategy)
+        requests = [Request(f"https://example.com/{i}", priority=p) for i, p in enumerate([5, 5, 10, 1, 5])]
+        for request in requests[:4]:
+            await scheduler.enqueue(request)
+        first = await scheduler.dequeue()
+        assert first is requests[2]
+        scheduler.complete(first)
+        await scheduler.enqueue(requests[4])
+
+        for i in order:
+            request = await scheduler.dequeue()
+            assert request is requests[i]
+            scheduler.complete(request)
+
+        assert [request.priority for request in requests] == [5, 5, 10, 1, 5]
+        assert scheduler.is_empty
+        assert scheduler.snapshot()[0] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("strategy, order", [("bfs", [1, 2, 4, 0, 3]), ("dfs", [4, 2, 1, 3, 0])])
+    async def test_resume_keeps_order_and_unfinished_requests(self, strategy, order):
+        scheduler = Scheduler(crawl_strategy=strategy)
+        requests = [Request(f"https://example.com/{i}", priority=p) for i, p in enumerate([1, 5, 5, 1, 5])]
+        for request in requests[:4]:
+            await scheduler.enqueue(request)
+        unfinished = await scheduler.dequeue()
+        pending, seen = scheduler.snapshot()
+        assert unfinished in pending
+        data = pickle.loads(pickle.dumps(CheckpointData(requests=pending, seen=seen)))
+        saved_urls = [request.url for request in data.requests]
+        restored = Scheduler(crawl_strategy=strategy)
+        restored.restore(data)
+        assert [request.url for request in data.requests] == saved_urls
+        assert [request.url for request in restored.snapshot()[0]] == saved_urls
+        assert not await restored.enqueue(Request(requests[0].url))
+        await restored.enqueue(requests[4])
+
+        for i in order:
+            request = await restored.dequeue()
+            assert request.url == requests[i].url
+            restored.complete(request)
+
+        assert restored.is_empty
+        assert restored.snapshot()[0] == []
 
 
 class TestSchedulerEnqueue:
@@ -228,22 +285,26 @@ class TestSchedulerSnapshot:
         assert b"new_fingerprint_bytes" not in original_seen
 
     @pytest.mark.asyncio
-    async def test_snapshot_excludes_dequeued_requests(self):
-        """Test snapshot only includes pending requests."""
+    async def test_snapshot_includes_in_flight_requests(self):
+        """Test snapshot retains dequeued-but-not-completed (in-flight) requests."""
         scheduler = Scheduler()
 
         await scheduler.enqueue(Request("https://example.com/1"))
         await scheduler.enqueue(Request("https://example.com/2"))
         await scheduler.enqueue(Request("https://example.com/3"))
 
-        # Dequeue one
-        await scheduler.dequeue()
+        in_flight = await scheduler.dequeue()
 
         requests, seen = scheduler.snapshot()
 
-        # Snapshot should only have 2 pending requests
+        assert len(requests) == 3
+        assert in_flight.url in {r.url for r in requests}
+        assert len(seen) == 3
+
+        scheduler.complete(in_flight)
+        requests, seen = scheduler.snapshot()
         assert len(requests) == 2
-        # But seen should still have all 3 (deduplication tracking)
+        assert in_flight.url not in {r.url for r in requests}
         assert len(seen) == 3
 
 
@@ -357,8 +418,8 @@ class TestSchedulerIntegration:
             await scheduler.enqueue(Request(f"https://example.com/{i}"))
 
         # Process 2
-        await scheduler.dequeue()
-        await scheduler.dequeue()
+        scheduler.complete(await scheduler.dequeue())
+        scheduler.complete(await scheduler.dequeue())
 
         # Snapshot should show 3 pending, 5 seen
         requests, seen = scheduler.snapshot()
@@ -384,3 +445,82 @@ class TestSchedulerIntegration:
         result = await new_scheduler.enqueue(Request("https://example.com", sid="s1"))
 
         assert result is False  # Duplicate filtered based on restored seen set
+
+
+class TestSchedulerInFlight:
+    """Test in-flight tracking so checkpoints don't lose dequeued requests."""
+
+    @pytest.mark.asyncio
+    async def test_dequeue_keeps_request_tracked(self):
+        """Dequeue does not drop the request; it stays tracked until completed."""
+        scheduler = Scheduler()
+
+        await scheduler.enqueue(Request("https://example.com/1"))
+        await scheduler.enqueue(Request("https://example.com/2"))
+
+        request = await scheduler.dequeue()
+
+        requests, _ = scheduler.snapshot()
+        assert len(requests) == 2
+        assert request.url in {r.url for r in requests}
+
+    @pytest.mark.asyncio
+    async def test_complete_stops_tracking_request(self):
+        """complete() drops the request from tracking (idempotently)."""
+        scheduler = Scheduler()
+
+        await scheduler.enqueue(Request("https://example.com/1"))
+        request = await scheduler.dequeue()
+
+        scheduler.complete(request)
+        requests, _ = scheduler.snapshot()
+        assert requests == []
+
+        scheduler.complete(request)
+        scheduler.complete(Request("https://example.com/unknown"))
+        requests, _ = scheduler.snapshot()
+        assert requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("strategy", ["bfs", "dfs"])
+    async def test_duplicate_instance_tracked_per_enqueue(self, strategy):
+        """Re-enqueuing the same Request instance (dont_filter) tracks each copy."""
+        scheduler = Scheduler(crawl_strategy=strategy)
+        request = Request("https://example.com/retry", dont_filter=True)
+
+        await scheduler.enqueue(request)
+        await scheduler.enqueue(request)
+
+        assert len(scheduler) == 2
+        requests, _ = scheduler.snapshot()
+        assert len(requests) == 2
+
+        scheduler.complete(await scheduler.dequeue())
+        requests, _ = scheduler.snapshot()
+        assert len(requests) == 1
+
+        scheduler.complete(await scheduler.dequeue())
+        assert scheduler.snapshot()[0] == []
+
+    @pytest.mark.asyncio
+    async def test_in_flight_request_survives_checkpoint_resume(self):
+        """Regression (F1): a request in-flight at checkpoint time survives resume."""
+        scheduler = Scheduler()
+
+        await scheduler.enqueue(Request("https://example.com/A"))
+        await scheduler.enqueue(Request("https://example.com/B"))
+
+        a = await scheduler.dequeue()
+        assert a.url == "https://example.com/A"
+
+        requests, seen = scheduler.snapshot()
+        data = CheckpointData(requests=requests, seen=seen)
+
+        restored = Scheduler()
+        restored.restore(data)
+
+        fetchable = set()
+        while not restored.is_empty:
+            fetchable.add((await restored.dequeue()).url)
+
+        assert fetchable == {"https://example.com/A", "https://example.com/B"}

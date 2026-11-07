@@ -72,11 +72,25 @@ class Spider(ABC):
     start_urls: list[str] = []
     allowed_domains: Set[str] = set()
 
+    # Robots.txt compliance
+    robots_txt_obey: bool = False
+
+    # Development mode
+    development_mode: bool = False
+    development_cache_dir: Optional[str] = None
+
     # Concurrency settings
     concurrent_requests: int = 4
     concurrent_requests_per_domain: int = 0
     download_delay: float = 0.0
     max_blocked_retries: int = 3
+
+    # AutoThrottle settings
+    autothrottle_enabled: bool = False
+    autothrottle_start_delay: float = 5.0
+    autothrottle_max_delay: float = 60.0
+    autothrottle_target_concurrency: Optional[float] = None
+    autothrottle_block_backoff: bool = True
 
     # Fingerprint adjustments
     fp_include_kwargs: bool = False
@@ -88,6 +102,7 @@ class Spider(ABC):
     logging_format: str = "[%(asctime)s]:({spider_name}) %(levelname)s: %(message)s"
     logging_date_format: str = "%Y-%m-%d %H:%M:%S"
     log_file: Optional[str] = None
+    log_file_encoding: Optional[str] = None
 
     def __init__(self, crawldir: Optional[Union[str, Path, AsyncPath]] = None, interval: float = 300.0):
         """Initialize the spider.
@@ -117,7 +132,7 @@ class Spider(ABC):
 
         if self.log_file:
             Path(self.log_file).parent.mkdir(parents=True, exist_ok=True)
-            file_handler = logging.FileHandler(self.log_file)
+            file_handler = logging.FileHandler(self.log_file, encoding=self.log_file_encoding)
             file_handler.setFormatter(formatter)
             self.logger.addHandler(file_handler)
 

@@ -19,6 +19,7 @@ from scrapling.core._types import (
     TypeAlias,
     SetCookieParam,
     SelectorWaitStates,
+    FollowRedirects,
 )
 from scrapling.engines.toolbelt.proxy_rotation import ProxyRotator
 
@@ -39,7 +40,7 @@ class RequestsSession(TypedDict, total=False):
     headers: Optional[Mapping[str, Optional[str]]]
     retries: Optional[int]
     retry_delay: Optional[int]
-    follow_redirects: Optional[bool]
+    follow_redirects: Optional[FollowRedirects]
     max_redirects: Optional[int]
     verify: Optional[bool]
     cert: Optional[str | Tuple[str, str]]
@@ -60,12 +61,13 @@ class DataRequestParams(GetRequestParams, total=False):
 
 
 # Types for browser session
-class PlaywrightSession(TypedDict, total=False):
+class _BrowserSession(TypedDict, total=False):
     max_pages: int
     headless: bool
     disable_resources: bool
     network_idle: bool
     load_dom: bool
+    pierce_shadow: bool
     wait_selector: Optional[str]
     wait_selector_state: SelectorWaitStates
     cookies: Sequence[SetCookieParam] | None
@@ -73,6 +75,7 @@ class PlaywrightSession(TypedDict, total=False):
     wait: int | float
     timezone_id: str | None
     page_action: Optional[Callable]
+    page_setup: Optional[Callable]
     proxy: Optional[str | Dict[str, str] | Tuple]
     proxy_rotator: Optional[ProxyRotator]
     extra_headers: Optional[Dict[str, str]]
@@ -82,17 +85,25 @@ class PlaywrightSession(TypedDict, total=False):
     selector_config: Optional[Dict]
     additional_args: Optional[Dict]
     locale: Optional[str]
-    real_chrome: bool
-    cdp_url: Optional[str]
     useragent: Optional[str]
     extra_flags: Optional[List[str]]
     blocked_domains: Optional[Set[str]]
+    block_ads: bool
     retries: int
     retry_delay: int | float
+    record_requests: bool
+    max_recorded_requests: int
+    executable_path: Optional[str]
+    dns_over_https: bool
+
+
+class PlaywrightSession(_BrowserSession, total=False):
+    real_chrome: bool
 
 
 class PlaywrightFetchParams(TypedDict, total=False):
     load_dom: bool
+    pierce_shadow: bool
     wait: int | float
     network_idle: bool
     google_search: bool
@@ -100,6 +111,7 @@ class PlaywrightFetchParams(TypedDict, total=False):
     disable_resources: bool
     wait_selector: Optional[str]
     page_action: Optional[Callable]
+    page_setup: Optional[Callable]
     selector_config: Optional[Dict]
     extra_headers: Optional[Dict[str, str]]
     wait_selector_state: SelectorWaitStates
@@ -107,11 +119,19 @@ class PlaywrightFetchParams(TypedDict, total=False):
     proxy: Optional[str | Dict[str, str]]
 
 
-class StealthSession(PlaywrightSession, total=False):
+class _StealthOptions(TypedDict, total=False):
     allow_webgl: bool
     hide_canvas: bool
     block_webrtc: bool
     solve_cloudflare: bool
+
+
+class StealthSession(PlaywrightSession, _StealthOptions, total=False):
+    pass
+
+
+class RemoteSessionParams(_BrowserSession, _StealthOptions, total=False):
+    pass
 
 
 class StealthFetchParams(PlaywrightFetchParams, total=False):

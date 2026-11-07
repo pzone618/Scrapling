@@ -1,23 +1,24 @@
 from time import time
+from pathlib import Path
 from asyncio import sleep as asyncio_sleep, Lock
-from contextlib import contextmanager, asynccontextmanager
+from contextlib import contextmanager, asynccontextmanager, suppress
 
-from playwright.sync_api._generated import Page
-from playwright.sync_api import (
+from patchright.sync_api import Page
+from patchright.sync_api import (
     Frame,
     BrowserContext,
     Response as SyncPlaywrightResponse,
 )
-from playwright.async_api._generated import Page as AsyncPage
-from playwright.async_api import (
+from patchright.async_api import Page as AsyncPage
+from patchright.async_api import (
     Frame as AsyncFrame,
     Response as AsyncPlaywrightResponse,
     BrowserContext as AsyncBrowserContext,
 )
-from playwright._impl._errors import Error as PlaywrightError
 
 from scrapling.parser import Selector
 from scrapling.engines._browsers._page import PageInfo, PagePool
+from scrapling.engines._browsers._network import NetworkRecorder
 from scrapling.engines._browsers._validators import validate, PlaywrightConfig, StealthConfig
 from scrapling.engines._browsers._config_tools import __default_chrome_useragent__, __default_useragent__
 from scrapling.engines.toolbelt.navigation import (
@@ -27,6 +28,7 @@ from scrapling.engines.toolbelt.navigation import (
 )
 from scrapling.core._types import (
     Any,
+    Awaitable,
     Dict,
     List,
     Set,
@@ -46,40 +48,70 @@ from scrapling.engines.constants import STEALTH_ARGS, HARMFUL_ARGS, DEFAULT_ARGS
 class SyncSession:
     _config: "PlaywrightConfig | StealthConfig"
     _context_options: Dict[str, Any]
+    if TYPE_CHECKING:
+        _build_context_with_proxy: Callable[..., Dict[str, Any]]
 
-    def _build_context_with_proxy(self, proxy: Optional[ProxyType] = None) -> Dict[str, Any]:
-        raise NotImplementedError  # pragma: no cover
-
-    def __init__(self, max_pages: int = 1):
+    def __init__(self, max_pages: int = 1, record_requests: bool = False, max_recorded_requests: int = 1000):
         self.max_pages = max_pages
+        self.network = NetworkRecorder(enabled=record_requests, max_requests=max_recorded_requests)
         self.page_pool = PagePool(max_pages)
         self._max_wait_for_page = 60
         self.playwright: Any = None
         self.context: Any = None
         self.browser: Any = None
         self._is_alive = False
+        self._owns_context = True
 
     def start(self) -> None:
         pass
 
+    def save_state(self, path: str | Path) -> None:
+        """Save cookies, local storage and IndexedDB to a Playwright-compatible JSON file.
+
+        Requires a started session without proxy rotation. Does not save sessionStorage.
+        """
+        if not self._is_alive or self.context is None:
+            raise RuntimeError("Session state requires a started browser session without proxy rotation")
+        self.context.storage_state(path=Path(path), indexed_db=True)
+
+    def load_state(self, path: str | Path) -> None:
+        """Replace cookies, local storage and IndexedDB from a Playwright-compatible JSON file.
+
+        Requires a started session without proxy rotation. Fetch or reload pages to use the restored login.
+        """
+        if not self._is_alive or self.context is None:
+            raise RuntimeError("Session state requires a started browser session without proxy rotation")
+        self.context.set_storage_state(path)
+
+    def close_pages(self) -> None:
+        """Close every open tab in the session's pool. The next request opens a fresh tab."""
+        for page_info in self.page_pool.clear():
+            with suppress(Exception):
+                page_info.page.close()
+
     def close(self):  # pragma: no cover
         """Close all resources"""
+        self.network._detach()
         if not self._is_alive:
             return
 
-        if self.context:
-            self.context.close()
+        self.close_pages()
+        try:
+            if self.context and self._owns_context:
+                self.context.close()
+        finally:
             self.context = None
-
-        if self.browser:
-            self.browser.close()
-            self.browser = None
-
-        if self.playwright:
-            self.playwright.stop()
-            self.playwright = None  # pyright: ignore
-
-        self._is_alive = False
+            try:
+                if self.browser:
+                    self.browser.close()
+            finally:
+                self.browser = None
+                try:
+                    if self.playwright:
+                        self.playwright.stop()
+                finally:
+                    self.playwright = None
+                    self._is_alive = False
 
     def __enter__(self):
         self.start()
@@ -96,6 +128,7 @@ class SyncSession:
         if config.cookies:  # pragma: no cover
             ctx.add_cookies(config.cookies)
 
+        self.network._attach(ctx)
         return ctx
 
     def _get_page(
@@ -106,21 +139,21 @@ class SyncSession:
         blocked_domains: Optional[Set[str]] = None,
         context: Optional[BrowserContext] = None,
     ) -> PageInfo[Page]:  # pragma: no cover
-        """Get a new page to use"""
-        # No need to check if a page is available or not in sync code because the code blocked before reaching here till the page closed, ofc.
-        ctx = context if context is not None else self.context
-        assert ctx is not None, "Browser context not initialized"
-        page = ctx.new_page()
+        """Get a ready page from the pool, or open a new one"""
+        page_info = self.page_pool.get_ready_page() if context is None else None
+        if page_info is None:
+            ctx = context if context is not None else self.context
+            assert ctx is not None, "Browser context not initialized"
+            page_info = self.page_pool.add_page(ctx.new_page())
+
+        page = cast(Page, page_info.page)
         page.set_default_navigation_timeout(timeout)
         page.set_default_timeout(timeout)
-        if extra_headers:
-            page.set_extra_http_headers(extra_headers)
-
+        page.set_extra_http_headers(extra_headers or {})
+        page.unroute_all(behavior="ignoreErrors")
         if disable_resources or blocked_domains:
             page.route("**/*", create_intercept_handler(disable_resources, blocked_domains))
-        page_info = self.page_pool.add_page(page)
-        page_info.mark_busy()
-        return page_info
+        return cast(PageInfo[Page], page_info)
 
     def get_pool_stats(self) -> Dict[str, int]:
         """Get statistics about the current page pool"""
@@ -131,11 +164,24 @@ class SyncSession:
         }
 
     @staticmethod
+    def _snapshot(
+        page: Page, depth: Optional[int] = None, boxes: bool = False, css_selector: Optional[str] = None
+    ) -> str:
+        """Return an AI ARIA snapshot of an existing browser page.
+
+        :param page: The browser page to snapshot.
+        :param depth: Limit the snapshot tree depth. Defaults to no limit.
+        :param boxes: Include element bounding boxes in viewport CSS pixels.
+        :param css_selector: Snapshot one matching element instead of the whole page.
+        """
+        return (page.locator(css_selector) if css_selector else page).aria_snapshot(mode="ai", depth=depth, boxes=boxes)
+
+    @staticmethod
     def _wait_for_networkidle(page: Page | Frame, timeout: Optional[int] = None):
         """Wait for the page to become idle (no network activity) even if there are never-ending requests."""
         try:
             page.wait_for_load_state("networkidle", timeout=timeout)
-        except (PlaywrightError, Exception):
+        except Exception:
             pass
 
     def _wait_for_page_stability(self, page: Page | Frame, load_dom: bool, network_idle: bool):
@@ -146,7 +192,10 @@ class SyncSession:
             self._wait_for_networkidle(page)
 
     @staticmethod
-    def _create_response_handler(page_info: PageInfo[Page], response_container: List) -> Callable:
+    def _create_response_handler(
+        page_info: PageInfo[Page],
+        response_container: List,
+    ) -> Callable[[SyncPlaywrightResponse], None]:
         """Create a response handler that captures the final navigation response.
 
         :param page_info: The PageInfo object containing the page
@@ -154,7 +203,7 @@ class SyncSession:
         :return: A callback function for page.on("response", ...)
         """
 
-        def handle_response(finished_response: SyncPlaywrightResponse):
+        def handle_response(finished_response: SyncPlaywrightResponse) -> None:
             if (
                 finished_response.request.resource_type == "document"
                 and finished_response.request.is_navigation_request()
@@ -181,11 +230,15 @@ class SyncSession:
             context_options = self._build_context_with_proxy(proxy)
             context: BrowserContext = self.browser.new_context(**context_options)
 
+            page_info = None
             try:
                 context = self._initialize_context(self._config, context)
                 page_info = self._get_page(timeout, extra_headers, disable_resources, blocked_domains, context=context)
                 yield page_info
             finally:
+                if page_info is not None:
+                    self.page_pool.remove_page(page_info)
+                self.network._detach(context)
                 context.close()
         else:
             # Standard mode: use PagePool with persistent context
@@ -193,48 +246,82 @@ class SyncSession:
             try:
                 yield page_info
             finally:
-                page_info.page.close()
-                self.page_pool.pages.remove(page_info)
+                if page_info.state == "error" or page_info.page.is_closed():
+                    with suppress(Exception):
+                        page_info.page.close()
+                    self.page_pool.remove_page(page_info)
+                else:
+                    page_info.mark_ready()
 
 
 class AsyncSession:
     _config: "PlaywrightConfig | StealthConfig"
     _context_options: Dict[str, Any]
+    if TYPE_CHECKING:
+        _build_context_with_proxy: Callable[..., Dict[str, Any]]
 
-    def _build_context_with_proxy(self, proxy: Optional[ProxyType] = None) -> Dict[str, Any]:
-        raise NotImplementedError  # pragma: no cover
-
-    def __init__(self, max_pages: int = 1):
+    def __init__(self, max_pages: int = 1, record_requests: bool = False, max_recorded_requests: int = 1000):
         self.max_pages = max_pages
+        self.network = NetworkRecorder(enabled=record_requests, max_requests=max_recorded_requests, asynchronous=True)
         self.page_pool = PagePool(max_pages)
         self._max_wait_for_page = 60
         self.playwright: Any = None
         self.context: Any = None
         self.browser: Any = None
         self._is_alive = False
+        self._owns_context = True
         self._lock = Lock()
 
     async def start(self) -> None:
         pass
 
+    async def save_state(self, path: str | Path) -> None:
+        """Save cookies, local storage and IndexedDB to a Playwright-compatible JSON file.
+
+        Requires a started session without proxy rotation. Does not save sessionStorage.
+        """
+        if not self._is_alive or self.context is None:
+            raise RuntimeError("Session state requires a started browser session without proxy rotation")
+        await self.context.storage_state(path=Path(path), indexed_db=True)
+
+    async def load_state(self, path: str | Path) -> None:
+        """Replace cookies, local storage and IndexedDB from a Playwright-compatible JSON file.
+
+        Requires a started session without proxy rotation. Fetch or reload pages to use the restored login.
+        """
+        if not self._is_alive or self.context is None:
+            raise RuntimeError("Session state requires a started browser session without proxy rotation")
+        await self.context.set_storage_state(path)
+
+    async def close_pages(self) -> None:
+        """Close every open tab in the session's pool. The next request opens a fresh tab."""
+        for page_info in self.page_pool.clear():
+            with suppress(Exception):
+                await cast(AsyncPage, page_info.page).close()
+
     async def close(self):
         """Close all resources"""
+        self.network._detach()
         if not self._is_alive:  # pragma: no cover
             return
 
-        if self.context:
-            await self.context.close()
-            self.context = None  # pyright: ignore
-
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
-
-        if self.playwright:
-            await self.playwright.stop()
-            self.playwright = None  # pyright: ignore
-
-        self._is_alive = False
+        await self.close_pages()
+        try:
+            if self.context and self._owns_context:
+                await self.context.close()
+        finally:
+            self.context = None
+            try:
+                if self.browser:
+                    await self.browser.close()
+            finally:
+                self.browser = None
+                try:
+                    if self.playwright:
+                        await self.playwright.stop()
+                finally:
+                    self.playwright = None
+                    self._is_alive = False
 
     async def __aenter__(self):
         await self.start()
@@ -253,6 +340,7 @@ class AsyncSession:
         if config.cookies:  # pragma: no cover
             await ctx.add_cookies(config.cookies)
 
+        self.network._attach(ctx)
         return ctx
 
     async def _get_page(
@@ -263,35 +351,37 @@ class AsyncSession:
         blocked_domains: Optional[Set[str]] = None,
         context: Optional[AsyncBrowserContext] = None,
     ) -> PageInfo[AsyncPage]:  # pragma: no cover
-        """Get a new page to use"""
+        """Get a ready page from the pool, or open a new one"""
         ctx = context if context is not None else self.context
         if TYPE_CHECKING:
             assert ctx is not None, "Browser context not initialized"
 
         async with self._lock:
-            # If we're at max capacity after cleanup, wait for busy pages to finish
-            if context is None and self.page_pool.pages_count >= self.max_pages:
-                # Only applies when using persistent context
+            page_info = self.page_pool.get_ready_page() if context is None else None
+            if page_info is None and context is None and self.page_pool.pages_count >= self.max_pages:
+                # At max capacity with the persistent context, so wait for a busy page to become ready
                 start_time = time()
                 while time() - start_time < self._max_wait_for_page:
                     await asyncio_sleep(0.05)
-                    if self.page_pool.pages_count < self.max_pages:
+                    page_info = self.page_pool.get_ready_page()
+                    if page_info is not None:
                         break
                 else:
                     raise TimeoutError(
                         f"No pages finished to clear place in the pool within the {self._max_wait_for_page}s timeout period"
                     )
 
-            page = await ctx.new_page()
+            if page_info is None:
+                page_info = self.page_pool.add_page(await ctx.new_page())
+
+            page = cast(AsyncPage, page_info.page)
             page.set_default_navigation_timeout(timeout)
             page.set_default_timeout(timeout)
-            if extra_headers:
-                await page.set_extra_http_headers(extra_headers)
-
+            await page.set_extra_http_headers(extra_headers or {})
+            await page.unroute_all(behavior="ignoreErrors")
             if disable_resources or blocked_domains:
                 await page.route("**/*", create_async_intercept_handler(disable_resources, blocked_domains))
-
-            return self.page_pool.add_page(page)
+            return cast(PageInfo[AsyncPage], page_info)
 
     def get_pool_stats(self) -> Dict[str, int]:
         """Get statistics about the current page pool"""
@@ -302,11 +392,26 @@ class AsyncSession:
         }
 
     @staticmethod
+    async def _snapshot(
+        page: AsyncPage, depth: Optional[int] = None, boxes: bool = False, css_selector: Optional[str] = None
+    ) -> str:
+        """Return an AI ARIA snapshot of an existing browser page.
+
+        :param page: The browser page to snapshot.
+        :param depth: Limit the snapshot tree depth. Defaults to no limit.
+        :param boxes: Include element bounding boxes in viewport CSS pixels.
+        :param css_selector: Snapshot one matching element instead of the whole page.
+        """
+        return await (page.locator(css_selector) if css_selector else page).aria_snapshot(
+            mode="ai", depth=depth, boxes=boxes
+        )
+
+    @staticmethod
     async def _wait_for_networkidle(page: AsyncPage | AsyncFrame, timeout: Optional[int] = None):
         """Wait for the page to become idle (no network activity) even if there are never-ending requests."""
         try:
             await page.wait_for_load_state("networkidle", timeout=timeout)
-        except (PlaywrightError, Exception):
+        except Exception:
             pass
 
     async def _wait_for_page_stability(self, page: AsyncPage | AsyncFrame, load_dom: bool, network_idle: bool):
@@ -317,7 +422,10 @@ class AsyncSession:
             await self._wait_for_networkidle(page)
 
     @staticmethod
-    def _create_response_handler(page_info: PageInfo[AsyncPage], response_container: List) -> Callable:
+    def _create_response_handler(
+        page_info: PageInfo[AsyncPage],
+        response_container: List,
+    ) -> Callable[[AsyncPlaywrightResponse], Awaitable[None]]:
         """Create an async response handler that captures the final navigation response.
 
         :param page_info: The PageInfo object containing the page
@@ -325,7 +433,7 @@ class AsyncSession:
         :return: A callback function for page.on("response", ...)
         """
 
-        async def handle_response(finished_response: AsyncPlaywrightResponse):
+        async def handle_response(finished_response: AsyncPlaywrightResponse) -> None:
             if (
                 finished_response.request.resource_type == "document"
                 and finished_response.request.is_navigation_request()
@@ -352,6 +460,7 @@ class AsyncSession:
             context_options = self._build_context_with_proxy(proxy)
             context: AsyncBrowserContext = await self.browser.new_context(**context_options)
 
+            page_info = None
             try:
                 context = await self._initialize_context(self._config, context)
                 page_info = await self._get_page(
@@ -359,6 +468,9 @@ class AsyncSession:
                 )
                 yield page_info
             finally:
+                if page_info is not None:
+                    self.page_pool.remove_page(page_info)
+                self.network._detach(context)
                 await context.close()
         else:
             # Standard mode: use PagePool with persistent context
@@ -366,8 +478,12 @@ class AsyncSession:
             try:
                 yield page_info
             finally:
-                await page_info.page.close()
-                self.page_pool.pages.remove(page_info)
+                if page_info.state == "error" or page_info.page.is_closed():
+                    with suppress(Exception):
+                        await page_info.page.close()
+                    self.page_pool.remove_page(page_info)
+                else:
+                    page_info.mark_ready()
 
 
 class BaseSessionMixin:
@@ -398,12 +514,11 @@ class BaseSessionMixin:
 
         return config
 
-    def __generate_options__(self, extra_flags: Tuple | None = None) -> None:
+    def __generate_context_options__(self) -> None:
         config: PlaywrightConfig | StealthConfig = self._config
         self._context_options.update(
             {
                 "proxy": config.proxy,
-                "locale": config.locale,
                 "timezone_id": config.timezone_id,
                 "extra_http_headers": config.extra_headers,
             }
@@ -416,25 +531,27 @@ class BaseSessionMixin:
                 __default_chrome_useragent__ if config.real_chrome else __default_useragent__
             )
 
-        if not config.cdp_url:
-            flags = self._browser_options["args"]
-            if config.extra_flags or extra_flags:
-                flags = list(set(tuple(flags) + tuple(config.extra_flags or extra_flags or ())))
-
-            self._browser_options.update(
-                {
-                    "args": flags,
-                    "headless": config.headless,
-                    "channel": "chrome" if config.real_chrome else "chromium",
-                }
-            )
-
-            self._user_data_dir = config.user_data_dir
-        else:
-            self._browser_options = {}
-
         if config.additional_args:
             self._context_options.update(config.additional_args)
+
+    def __generate_options__(self, extra_flags: Tuple | None = None) -> None:
+        self.__generate_context_options__()
+        config = self._config
+        flags = self._browser_options["args"]
+        if config.extra_flags or extra_flags:
+            flags = list(set(tuple(flags) + tuple(extra_flags or ()) + tuple(config.extra_flags or ())))
+        if config.dns_over_https:
+            flags = list(flags) + ["--dns-over-https-templates=https://cloudflare-dns.com/dns-query"]
+        if config.locale:
+            base_lang = config.locale.split("-")[0].lower()
+            accept_lang = f"{config.locale},{base_lang}" if base_lang != config.locale.lower() else config.locale
+            flags = list(flags) + [f"--lang={config.locale}", f"--accept-lang={accept_lang}"]
+        self._browser_options.update(
+            {"args": flags, "headless": config.headless, "channel": "chrome" if config.real_chrome else "chromium"}
+        )
+        if config.executable_path:
+            self._browser_options["executable_path"] = config.executable_path
+        self._user_data_dir = config.user_data_dir
 
     def _build_context_with_proxy(self, proxy: Optional[ProxyType] = None) -> Dict[str, Any]:
         """
@@ -453,15 +570,11 @@ class BaseSessionMixin:
         return context_options
 
 
-class DynamicSessionMixin(BaseSessionMixin):
-    def __validate__(self, **params):
-        self._config = self.__validate_routine__(params, model=PlaywrightConfig)
-        self.__generate_options__()
-
-
 class StealthySessionMixin(BaseSessionMixin):
+    _config_class: type[StealthConfig] = StealthConfig
+
     def __validate__(self, **params):
-        self._config = self.__validate_routine__(params, model=StealthConfig)
+        self._config = self.__validate_routine__(params, model=self._config_class)
         self._context_options.update(
             {
                 "is_mobile": False,
@@ -478,25 +591,14 @@ class StealthySessionMixin(BaseSessionMixin):
 
     def __generate_stealth_options(self) -> None:
         config = cast(StealthConfig, self._config)
-        flags: Tuple[str, ...] = tuple()
-        if not config.cdp_url:
-            flags = tuple(DEFAULT_ARGS) + tuple(STEALTH_ARGS)
-
-            if config.block_webrtc:
-                flags += (
-                    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-                    "--force-webrtc-ip-handling-policy",  # Ensures the policy is enforced
-                )
-            if not config.allow_webgl:
-                flags += (
-                    "--disable-webgl",
-                    "--disable-webgl-image-chromium",
-                    "--disable-webgl2",
-                )
-            if config.hide_canvas:
-                flags += ("--fingerprinting-canvas-image-data-noise",)
-
-        super(StealthySessionMixin, self).__generate_options__(flags)
+        flags = tuple(DEFAULT_ARGS) + tuple(STEALTH_ARGS)
+        if config.block_webrtc:
+            flags += ("--webrtc-ip-handling-policy=disable_non_proxied_udp", "--force-webrtc-ip-handling-policy")
+        if not config.allow_webgl:
+            flags += ("--disable-webgl", "--disable-webgl-image-chromium", "--disable-webgl2")
+        if config.hide_canvas:
+            flags += ("--fingerprinting-canvas-image-data-noise",)
+        self.__generate_options__(flags)
 
     @staticmethod
     def _detect_cloudflare(page_content: str) -> str | None:
@@ -532,3 +634,17 @@ class StealthySessionMixin(BaseSessionMixin):
             return "embedded"
 
         return None
+
+    @classmethod
+    def _challenge_cleared(cls, page_content: str, challenge_type: str) -> bool:
+        """
+        Check whether the Cloudflare challenge is no longer present in the page content.
+
+        Args:
+            page_content (str): The content of the page to analyze.
+            challenge_type (str): The challenge type returned by `_detect_cloudflare`.
+
+        Returns:
+            bool: True if the challenge is gone from the page, False otherwise.
+        """
+        return challenge_type == "embedded" or cls._detect_cloudflare(page_content) is None

@@ -2,7 +2,7 @@
 from sys import stderr
 from copy import deepcopy
 from functools import wraps
-from re import sub as re_sub
+from re import sub as re_sub, compile as re_compile, DOTALL, IGNORECASE
 from collections import namedtuple
 from shlex import split as shlex_split
 from inspect import signature, Parameter
@@ -21,6 +21,7 @@ from logging import (
     getLevelName,
 )
 
+from lxml.etree import XPath
 from orjson import loads as json_loads, JSONDecodeError
 
 from ._shell_signatures import Signatures_map
@@ -34,6 +35,7 @@ from scrapling.core._types import (
     Callable,
     Dict,
     Any,
+    Match,
     cast,
     Optional,
     Generator,
@@ -66,6 +68,60 @@ Request = namedtuple(
         "follow_redirects",  # Added for -L flag
     ],
 )
+
+# Precompiled for the prompt injection sanitizer
+_HIDDEN_XPATH = XPath(".//*[@style] | .//*[@aria-hidden='true'] | .//slot[@hidden] | .//template")
+_HIDING_DECLARATIONS = frozenset({("display", "none"), ("visibility", "hidden")})
+_ZERO_HIDING_PROPERTIES = frozenset({"opacity", "font-size", "height", "width", "max-height", "max-width"})
+# CSS reads CRLF, CR and FF as a single LF, which ends an unfinished string
+_CSS_NEWLINE_PATTERN = re_compile(r"\r\n?|\f")
+# Escapes, strings and unquoted `url()` tokens are matched first so a `/*`, a quote or a `;` inside them is never
+# read as CSS. An unquoted `url(` runs to the first unescaped `)` even when malformed, as browsers skip a bad url
+_STYLE_TOKEN_PATTERN = re_compile(
+    r"""(\\.)|"(?:[^"\\\n]|\\.)*"?|'(?:[^'\\\n]|\\.)*'?"""
+    r"""|(?<![\w-])url\((?![ \t\n]*["'])(?:[^)\\]|\\.?)*\)?|(/\*.*?(?:\*/|\Z))""",
+    DOTALL | IGNORECASE,
+)
+_ZERO_VALUE_PATTERN = re_compile(r"[+-]?(?:0+(?:\.0+)?|\.0+)(?:e[+-]?[0-9]+)?[a-z%]*")
+_IMPORTANT_SUFFIX_PATTERN = re_compile(r"![ \t\n]*important$")
+_ZWC_PATTERN = re_compile(r"[\u200b\u200c\u200d\ufeff\u2060\u180e]")
+_CONTROL_CHARS_PATTERN = re_compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _blank_style_token(match: Match[str]) -> str:
+    """Keep an escape, replace a comment with a space and a string or `url()` with an empty string.
+
+    A comment separates tokens instead of joining them, so `no/**/ne` never reads as `none`,
+    and no hiding value contains a string or a `url()`, so their content can be dropped.
+    """
+    if match.group(1):
+        return match.group(1)
+    return " " if match.group(2) else '""'
+
+
+def _is_hidden_element(element: Any) -> bool:
+    """Check if an element selected by `_HIDDEN_XPATH` is hidden from the page's readers.
+
+    Inline styles are compared declaration by declaration instead of by substring, so a value that
+    only starts with a zero (`opacity:0.95`) or a longer property name (`line-height:0.9`) is kept.
+    """
+    if element.tag == "template" or element.get("aria-hidden") == "true":
+        return True
+    if element.tag == "slot" and element.get("hidden") is not None:
+        return True
+
+    style = _CSS_NEWLINE_PATTERN.sub("\n", element.get("style") or "")
+    style = _STYLE_TOKEN_PATTERN.sub(_blank_style_token, style)
+    for declaration in style.split(";"):
+        prop, _, value = declaration.partition(":")
+        prop = prop.strip(" \t\n").lower()
+        value = _IMPORTANT_SUFFIX_PATTERN.sub("", value.strip(" \t\n").lower()).rstrip(" \t\n")
+        if (prop, value) in _HIDING_DECLARATIONS:
+            return True
+        if prop in _ZERO_HIDING_PROPERTIES and _ZERO_VALUE_PATTERN.fullmatch(value):
+            return True
+
+    return False
 
 
 # Suppress exit on error to handle parsing errors gracefully
@@ -122,6 +178,7 @@ class CurlParser:
         # Connection/Security
         _parser.add_argument("-k", "--insecure", action="store_true")
         _parser.add_argument("--compressed", action="store_true")  # Very common from browsers
+        _parser.add_argument("-L", "--location", action="store_true")  # Redirects are followed anyway
 
         # Other flags often included but may not map directly to request args
         _parser.add_argument("-i", "--include", action="store_true")
@@ -178,6 +235,10 @@ class CurlParser:
             method = "post"
 
         headers, cookies = _ParseHeaders(parsed_args.header)
+
+        # `-A` only applies when `-H` didn't already set a user agent
+        if parsed_args.user_agent and not any(key.lower() == "user-agent" for key in headers):
+            headers["User-Agent"] = parsed_args.user_agent
 
         if parsed_args.cookie:
             # We are focusing on the string format from DevTools.
@@ -280,7 +341,7 @@ class CurlParser:
             headers=headers,
             cookies=cookies,
             proxy=proxies,
-            follow_redirects=True,  # Scrapling default is True
+            follow_redirects="safe",  # Follows redirects but rejects those to internal/private IPs
         )
 
     def convert2fetcher(self, curl_command: Request | str) -> Optional[Response]:
@@ -293,6 +354,9 @@ class CurlParser:
                 return None
 
             request_args = request._asdict()
+            if isinstance(request_args["proxy"], dict):
+                # The fetchers take a single proxy URL, not a per-scheme dict
+                request_args["proxy"] = request_args["proxy"].get("https") or request_args["proxy"].get("http")
             method = request_args.pop("method").strip().lower()
             if method in self._supported_methods:
                 request_args["json"] = request_args.pop("json_data")
@@ -376,24 +440,22 @@ class CustomShell:
             Fetcher as __Fetcher,
             AsyncFetcher as __AsyncFetcher,
             FetcherSession as __FetcherSession,
-            DynamicFetcher as __DynamicFetcher,
-            DynamicSession as __DynamicSession,
-            AsyncDynamicSession as __AsyncDynamicSession,
             StealthyFetcher as __StealthyFetcher,
             StealthySession as __StealthySession,
             AsyncStealthySession as __AsyncStealthySession,
+            RemoteSession as __RemoteSession,
+            AsyncRemoteSession as __AsyncRemoteSession,
         )
 
         self.__InteractiveShellEmbed = __InteractiveShellEmbed
         self.__Fetcher = __Fetcher
         self.__AsyncFetcher = __AsyncFetcher
         self.__FetcherSession = __FetcherSession
-        self.__DynamicFetcher = __DynamicFetcher
-        self.__DynamicSession = __DynamicSession
-        self.__AsyncDynamicSession = __AsyncDynamicSession
         self.__StealthyFetcher = __StealthyFetcher
         self.__StealthySession = __StealthySession
         self.__AsyncStealthySession = __AsyncStealthySession
+        self.__RemoteSession = __RemoteSession
+        self.__AsyncRemoteSession = __AsyncRemoteSession
         self.code = code
         self.page = None
         self.pages = Selectors([])
@@ -430,8 +492,8 @@ class CustomShell:
         return f"""
 -> Available Scrapling objects:
    - Fetcher/AsyncFetcher/FetcherSession
-   - DynamicFetcher/DynamicSession/AsyncDynamicSession
    - StealthyFetcher/StealthySession/AsyncStealthySession
+   - RemoteSession/AsyncRemoteSession
    - Selector
 
 -> Useful shortcuts:
@@ -439,8 +501,7 @@ class CustomShell:
    - {"post":<30} Shortcut for `Fetcher.post`
    - {"put":<30} Shortcut for `Fetcher.put`
    - {"delete":<30} Shortcut for `Fetcher.delete`
-   - {"fetch":<30} Shortcut for `DynamicFetcher.fetch`
-   - {"stealthy_fetch":<30} Shortcut for `StealthyFetcher.fetch`
+   - {"fetch":<30} Shortcut for `StealthyFetcher.fetch`
 
 -> Useful commands
    - {"page / response":<30} The response object of the last page you fetched
@@ -495,8 +556,7 @@ Type 'exit' or press Ctrl+D to exit.
         post = self.create_wrapper(self.__Fetcher.post)
         put = self.create_wrapper(self.__Fetcher.put)
         delete = self.create_wrapper(self.__Fetcher.delete)
-        dynamic_fetch = self.create_wrapper(self.__DynamicFetcher.fetch)
-        stealthy_fetch = self.create_wrapper(self.__StealthyFetcher.fetch, signature_name="stealthy_fetch")
+        fetch = self.create_wrapper(self.__StealthyFetcher.fetch)
         curl2fetcher = self.create_wrapper(self._curl_parser.convert2fetcher, get_signature=False)
 
         # Create the namespace dictionary
@@ -508,13 +568,11 @@ Type 'exit' or press Ctrl+D to exit.
             "Fetcher": self.__Fetcher,
             "AsyncFetcher": self.__AsyncFetcher,
             "FetcherSession": self.__FetcherSession,
-            "DynamicSession": self.__DynamicSession,
-            "AsyncDynamicSession": self.__AsyncDynamicSession,
             "StealthySession": self.__StealthySession,
             "AsyncStealthySession": self.__AsyncStealthySession,
-            "fetch": dynamic_fetch,
-            "DynamicFetcher": self.__DynamicFetcher,
-            "stealthy_fetch": stealthy_fetch,
+            "RemoteSession": self.__RemoteSession,
+            "AsyncRemoteSession": self.__AsyncRemoteSession,
+            "fetch": fetch,
             "StealthyFetcher": self.__StealthyFetcher,
             "Selector": Selector,
             "page": self.page,
@@ -568,7 +626,12 @@ class Convertor:
     @classmethod
     def _convert_to_markdown(cls, body: TextHandler) -> str:
         """Convert HTML content to Markdown"""
-        from markdownify import markdownify
+        try:
+            from markdownify import markdownify
+        except (ImportError, ModuleNotFoundError) as e:
+            raise ModuleNotFoundError(
+                'Markdown conversion requires the "markdownify" package. Install it with: pip install "scrapling[rag]"'
+            ) from e
 
         return markdownify(body)
 
@@ -576,9 +639,29 @@ class Convertor:
     def _strip_noise_tags(cls, page: Selector) -> Selector:
         """Return a copy of the Selector with noise tags removed."""
         clean_root = deepcopy(page._root)
-        for element in clean_root.iter(*{"script", "style", "noscript", "svg"}):
+        # Collect first: dropping a match mid-walk sends the iterator into the detached subtree, where it ends
+        for element in list(clean_root.iter(*{"script", "style", "noscript", "svg"})):
             element.drop_tree()
         return Selector(root=clean_root, url=page.url)
+
+    @classmethod
+    def _sanitize_for_ai(cls, page: Selector) -> Selector:
+        """Strip hidden content that could be used for prompt injection.
+
+        Removes CSS-hidden elements, hidden slots, aria-hidden elements, <template> tags,
+        HTML comments, zero-width Unicode characters, and XML-incompatible
+        control characters.
+        """
+        clean_root = deepcopy(page._root)
+        for element in cast(list, _HIDDEN_XPATH(clean_root)):
+            if _is_hidden_element(element):
+                element.drop_tree()
+        for element in clean_root.iter():
+            if element.text:
+                element.text = _CONTROL_CHARS_PATTERN.sub("", _ZWC_PATTERN.sub("", element.text))
+            if element.tail:
+                element.tail = _CONTROL_CHARS_PATTERN.sub("", _ZWC_PATTERN.sub("", element.tail))
+        return Selector(root=clean_root, url=page.url, keep_comments=False)
 
     @classmethod
     def _extract_content(
@@ -597,6 +680,7 @@ class Convertor:
             if main_content_only:
                 page = cast(Selector, page.css("body").first) or page
                 page = cls._strip_noise_tags(page)
+                page = cls._sanitize_for_ai(page)
 
             pages = [page] if not css_selector else cast(Selectors, page.css(css_selector))
             for page in pages:
@@ -621,7 +705,9 @@ class Convertor:
             yield ""
 
     @classmethod
-    def write_content_to_file(cls, page: Selector, filename: str, css_selector: Optional[str] = None) -> None:
+    def write_content_to_file(
+        cls, page: Selector, filename: str, css_selector: Optional[str] = None, main_content_only: bool = False
+    ) -> None:
         """Write a Selector's content to a file"""
         if not page or not isinstance(page, Selector):  # pragma: no cover
             raise TypeError("Input must be of type `Selector`")
@@ -630,14 +716,15 @@ class Convertor:
         elif not filename.endswith((".md", ".html", ".txt")):
             raise ValueError("Unknown file type: filename must end with '.md', '.html', or '.txt'")
         else:
-            with open(filename, "w", encoding=page.encoding) as f:
-                extension = filename.split(".")[-1]
-                f.write(
-                    "".join(
-                        cls._extract_content(
-                            page,
-                            cls._extension_map[extension],
-                            css_selector=css_selector,
-                        )
-                    )
-                )
+            extension = filename.split(".")[-1]
+            content = cls._extract_content(
+                page,
+                cls._extension_map[extension],
+                css_selector=css_selector,
+                main_content_only=main_content_only,
+            )
+            # Build the whole text before opening the file so a failure can't leave an empty file behind
+            text = ("\n\n" if extension == "md" else "").join(filter(None, content))
+            # Markdown and text are produced by the converter, so they don't depend on the page charset
+            with open(filename, "w", encoding=page.encoding if extension == "html" else "utf-8") as f:
+                f.write(text)

@@ -4,9 +4,9 @@ from scrapling.spiders.request import Request
 from scrapling.engines.static import _ASyncSessionLogic
 from scrapling.engines.toolbelt.convertor import Response
 from scrapling.core._types import Set, cast, SUPPORTED_HTTP_METHODS
-from scrapling.fetchers import AsyncDynamicSession, AsyncStealthySession, FetcherSession
+from scrapling.fetchers import AsyncStealthySession, FetcherSession
 
-Session = FetcherSession | AsyncDynamicSession | AsyncStealthySession
+Session = FetcherSession | AsyncStealthySession
 
 
 class SessionManager:
@@ -93,7 +93,9 @@ class SessionManager:
 
     async def close(self) -> None:
         """Close all registered sessions."""
-        for session in self._sessions.values():
+        for sid, session in self._sessions.items():
+            if sid in self._lazy_sessions and not session._is_alive:
+                continue
             _ = await session.__aexit__(None, None, None)
 
         self._started = False
@@ -112,10 +114,15 @@ class SessionManager:
                 client = session._client
 
                 if isinstance(client, _ASyncSessionLogic):
+                    kwargs = request._session_kwargs.copy()
+                    method = cast(SUPPORTED_HTTP_METHODS, kwargs.pop("method", "GET"))
+                    if "stealthy_headers" in kwargs:
+                        # Same mapping as the public session methods (`get`, `post`, ...), so it doesn't reach curl_cffi
+                        kwargs["stealth"] = kwargs.pop("stealthy_headers")
                     response = await client._make_request(
-                        method=cast(SUPPORTED_HTTP_METHODS, request._session_kwargs.pop("method", "GET")),
+                        method=method,
                         url=request.url,
-                        **request._session_kwargs,
+                        **kwargs,
                     )
                 else:
                     # Sync session or other types - shouldn't happen in async context

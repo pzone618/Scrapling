@@ -53,6 +53,19 @@ _whitelisted = {
     "for_": "for",
 }
 _T = TypeVar("_T")
+
+
+def _escape_css_string(value: str) -> str:
+    """Escape the characters that can't appear literally inside a CSS double-quoted string.
+
+    Line breaks have to be written as hexadecimal escapes, the trailing space ends the escape.
+    Backslashes are left alone on purpose: `cssselect` drops characters while unescaping them
+    (both `\\\\` and `\\5C ` lose the backslash and the character after it), so no form we could
+    emit here would match them anyway.
+    """
+    return value.replace('"', r"\"").replace("\n", r"\A ").replace("\r", r"\D ").replace("\f", r"\C ")
+
+
 # Pre-compiled selectors for efficiency
 _find_all_elements = XPath(".//*")
 _find_all_elements_with_spaces = XPath(
@@ -73,7 +86,6 @@ class Selector(SelectorsGeneration):
         "__attributes",
         "__text",
         "__tag",
-        "__keep_cdata",
         "_raw_body",
     )
 
@@ -85,7 +97,6 @@ class Selector(SelectorsGeneration):
         huge_tree: bool = True,
         root: Optional[HtmlElement] = None,
         keep_comments: Optional[bool] = False,
-        keep_cdata: Optional[bool] = False,
         adaptive: Optional[bool] = False,
         _storage: Optional[StorageSystemMixin] = None,
         storage: Any = SQLiteStorageSystem,
@@ -108,7 +119,6 @@ class Selector(SelectorsGeneration):
         :param root: Used internally to pass etree objects instead of text/body arguments, it takes the highest priority.
             Don't use it unless you know what you are doing!
         :param keep_comments: While parsing the HTML body, drop comments or not. Disabled by default for obvious reasons
-        :param keep_cdata: While parsing the HTML body, drop cdata or not. Disabled by default for cleaner HTML.
         :param adaptive: Globally turn off the adaptive feature in all functions, this argument takes higher
             priority over all adaptive related arguments/functions in the class.
         :param storage: The storage class to be passed for adaptive functionalities, see ``Docs`` for more info.
@@ -121,7 +131,6 @@ class Selector(SelectorsGeneration):
         self.url = url
         self._raw_body: str | bytes = ""
         self.encoding = encoding
-        self.__keep_cdata = keep_cdata
         self.__huge_tree_enabled = huge_tree
         self.__keep_comments = keep_comments
         # For selector stuff
@@ -147,10 +156,12 @@ class Selector(SelectorsGeneration):
                 compact=True,
                 huge_tree=huge_tree,
                 default_doctype=True,  # Supported by lxml but missing from stubs
-                strip_cdata=(not keep_cdata),
             )
             parser = HTMLParser(**_parser_kwargs)
-            self._root = cast(HtmlElement, fromstring(body or "<html/>", parser=parser, base_url=url or ""))
+            parsed_root = fromstring(body or "<html/>", parser=parser, base_url=url or "")
+            if parsed_root is None:
+                parsed_root = fromstring("<html/>", parser=parser, base_url=url or "")
+            self._root = cast(HtmlElement, parsed_root)
             self._raw_body = content
 
         else:
@@ -212,7 +223,6 @@ class Selector(SelectorsGeneration):
             adaptive=self.__adaptive_enabled,
             _storage=self._storage,
             keep_comments=self.__keep_comments,
-            keep_cdata=self.__keep_cdata,
             huge_tree=self.__huge_tree_enabled,
         )
 
@@ -223,7 +233,6 @@ class Selector(SelectorsGeneration):
         adaptive = self.__adaptive_enabled
         storage = self._storage
         comments = self.__keep_comments
-        cdata = self.__keep_cdata
         huge_tree = self.__huge_tree_enabled
 
         return Selectors(
@@ -234,7 +243,6 @@ class Selector(SelectorsGeneration):
                 adaptive=adaptive,
                 _storage=storage,
                 keep_comments=comments,
-                keep_cdata=cdata,
                 huge_tree=huge_tree,
             )
             for el in elements
@@ -300,7 +308,9 @@ class Selector(SelectorsGeneration):
 
         ignored_elements: set[Any] = set()
         if ignore_tags:
-            ignored_elements.update(self._root.iter(*ignore_tags))
+            for element in self._root.iter(*ignore_tags):
+                if element not in ignored_elements:
+                    ignored_elements.update(element.iter())
 
         _all_strings = []
 
@@ -315,11 +325,7 @@ class Selector(SelectorsGeneration):
                 return False
 
             owner = parent.getparent() if text_node.is_tail else parent
-            while owner is not None:
-                if owner in ignored_elements:
-                    return False
-                owner = owner.getparent()
-            return True
+            return owner not in ignored_elements
 
         for text_node in cast(list[_ElementUnicodeResult], _find_all_text_nodes(self._root)):
             text = str(text_node)
@@ -519,7 +525,7 @@ class Selector(SelectorsGeneration):
     def relocate(
         self,
         element: Union[Dict, HtmlElement, "Selector"],
-        percentage: int = 0,
+        percentage: int = 40,
         selector_type: bool = False,
     ) -> Union[List[HtmlElement], "Selectors"]:
         """This function will search again for the element in the page tree, used automatically on page structure change
@@ -559,6 +565,10 @@ class Selector(SelectorsGeneration):
                 if not selector_type:
                     return score_table[highest_probability]
                 return self.__elements_convertor(score_table[highest_probability])
+            log.warning(
+                f"Adaptive relocation found no element above the {percentage}% threshold "
+                f"(top score: {highest_probability}%). Lower `percentage` if this is the right element."
+            )
         return []
 
     def css(
@@ -567,7 +577,7 @@ class Selector(SelectorsGeneration):
         identifier: str = "",
         adaptive: bool = False,
         auto_save: bool = False,
-        percentage: int = 0,
+        percentage: int = 40,
     ) -> "Selectors":
         """Search the current tree with CSS3 selectors
 
@@ -627,7 +637,7 @@ class Selector(SelectorsGeneration):
         identifier: str = "",
         adaptive: bool = False,
         auto_save: bool = False,
-        percentage: int = 0,
+        percentage: int = 40,
         **kwargs: Any,
     ) -> "Selectors":
         """Search the current tree with XPath selectors
@@ -653,7 +663,13 @@ class Selector(SelectorsGeneration):
             return Selectors()
 
         try:
-            if elements := self._root.xpath(selector, **kwargs):
+            elements = self._root.xpath(selector, **kwargs)
+            # string(), count(), boolean() and the like return one value instead of a list of nodes
+            if not isinstance(elements, list):
+                value = ("1" if elements else "0") if isinstance(elements, bool) else str(elements)
+                return self.__elements_convertor([_ElementUnicodeResult(value)])
+
+            if elements:
                 if not self.__adaptive_enabled and auto_save:
                     log.warning(
                         "Argument `auto_save` will be ignored because `adaptive` wasn't enabled on initialization. Check docs for more info."
@@ -667,7 +683,7 @@ class Selector(SelectorsGeneration):
                     element_data = self.retrieve(identifier or selector)
                     if element_data:
                         elements = self.relocate(element_data, percentage)
-                        if elements is not None and auto_save:
+                        if elements and auto_save:
                             self.save(elements[0], identifier or selector)
 
                 return self.__handle_elements(elements)
@@ -758,9 +774,13 @@ class Selector(SelectorsGeneration):
         for tag in tags:
             selector = tag
             for key, value in attributes.items():
-                value = value.replace('"', r"\"")  # Escape double quotes in user input
                 # Not escaping anything with the key so the user can pass patterns like {'href*': '/p/'} or get errors :)
-                selector += '[{}="{}"]'.format(key, value)
+                if key == "class" and (class_names := value.split()):
+                    # `class` is a space-separated list, so exact-match [class="x"] misses class="x y"; match each name with ~=
+                    # An empty/blank value has no names to match, so it falls through to the exact match below
+                    selector += "".join('[class~="{}"]'.format(_escape_css_string(name)) for name in class_names)
+                else:
+                    selector += '[{}="{}"]'.format(key, _escape_css_string(value))
             if selector != "*":
                 selectors.append(selector)
 
@@ -987,7 +1007,9 @@ class Selector(SelectorsGeneration):
                 SequenceMatcher(None, v, candidate_attributes.get(k, "")).ratio()
                 for k, v in original_attributes.items()
             )
-            checks += len(candidate_attributes)
+            # Using `max` so candidates with extra attributes are penalized and candidates
+            # with fewer attributes don't get inflated scores from a smaller denominator
+            checks += max(len(original_attributes), len(candidate_attributes))
         else:
             if not candidate_attributes:
                 # Both don't have attributes, this must mean something
@@ -1004,7 +1026,7 @@ class Selector(SelectorsGeneration):
 
         if checks:
             return round(score / checks, 2) >= similarity_threshold
-        return False
+        return 0 >= similarity_threshold
 
     def find_similar(
         self,
@@ -1111,7 +1133,7 @@ class Selector(SelectorsGeneration):
 
         possible_targets = cast(List, _find_all_elements_with_spaces(self._root))
         if possible_targets:
-            for node in self.__elements_convertor(possible_targets):
+            for node in map(self.__element_convertor, possible_targets):
                 """Check if element matches given text otherwise, traverse the children tree and iterate"""
                 node_text: TextHandler = node.text
                 if clean_match:
@@ -1173,7 +1195,7 @@ class Selector(SelectorsGeneration):
 
         possible_targets = cast(List, _find_all_elements_with_spaces(self._root))
         if possible_targets:
-            for node in self.__elements_convertor(possible_targets):
+            for node in map(self.__element_convertor, possible_targets):
                 """Check if element matches given regex otherwise, traverse the children tree and iterate"""
                 node_text = node.text
                 if node_text.re(
@@ -1220,7 +1242,7 @@ class Selectors(List[Selector]):
         selector: str,
         identifier: str = "",
         auto_save: bool = False,
-        percentage: int = 0,
+        percentage: int = 40,
         **kwargs: Any,
     ) -> "Selectors":
         """
@@ -1251,7 +1273,7 @@ class Selectors(List[Selector]):
         selector: str,
         identifier: str = "",
         auto_save: bool = False,
-        percentage: int = 0,
+        percentage: int = 40,
     ) -> "Selectors":
         """
         Call the ``.css()`` method for each element in this list and return

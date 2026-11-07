@@ -8,7 +8,9 @@ import pytest
 
 from scrapling.spiders.engine import CrawlerEngine, _dump
 from scrapling.spiders.request import Request
+from scrapling.spiders.robotstxt import RobotsTxtManager
 from scrapling.spiders.session import SessionManager
+from scrapling.spiders.scheduler import Scheduler
 from scrapling.spiders.result import CrawlStats, ItemList
 from scrapling.spiders.checkpoint import CheckpointData
 from scrapling.core._types import Any, Dict, Set, AsyncGenerator
@@ -22,10 +24,11 @@ from scrapling.core._types import Any, Dict, Set, AsyncGenerator
 class MockResponse:
     """Minimal Response stand-in."""
 
-    def __init__(self, status: int = 200, body: bytes = b"ok", url: str = "https://example.com"):
+    def __init__(self, status: int = 200, body: bytes = b"ok", url: str = "https://example.com", encoding: str = "utf-8"):
         self.status = status
         self.body = body
         self.url = url
+        self.encoding = encoding
         self.request: Any = None
         self.meta: Dict[str, Any] = {}
 
@@ -76,6 +79,11 @@ class MockSpider:
         concurrent_requests_per_domain: int = 0,
         download_delay: float = 0.0,
         max_blocked_retries: int = 3,
+        autothrottle_enabled: bool = False,
+        autothrottle_start_delay: float = 5.0,
+        autothrottle_max_delay: float = 60.0,
+        autothrottle_target_concurrency: float | None = None,
+        autothrottle_block_backoff: bool = True,
         allowed_domains: Set[str] | None = None,
         fp_include_kwargs: bool = False,
         fp_include_headers: bool = False,
@@ -83,16 +91,27 @@ class MockSpider:
         is_blocked_fn=None,
         on_scraped_item_fn=None,
         retry_blocked_request_fn=None,
+        robots_txt_obey: bool = False,
+        start_urls: list[str] | None = None,
     ):
         self.concurrent_requests = concurrent_requests
         self.concurrent_requests_per_domain = concurrent_requests_per_domain
         self.download_delay = download_delay
         self.max_blocked_retries = max_blocked_retries
+        self.autothrottle_enabled = autothrottle_enabled
+        self.autothrottle_start_delay = autothrottle_start_delay
+        self.autothrottle_max_delay = autothrottle_max_delay
+        self.autothrottle_target_concurrency = autothrottle_target_concurrency
+        self.autothrottle_block_backoff = autothrottle_block_backoff
         self.allowed_domains = allowed_domains or set()
         self.fp_include_kwargs = fp_include_kwargs
         self.fp_include_headers = fp_include_headers
         self.fp_keep_fragments = fp_keep_fragments
         self.name = "test_spider"
+        self.robots_txt_obey = robots_txt_obey
+        self.development_mode = False
+        self.development_cache_dir = None
+        self.start_urls = start_urls or []
 
         # Tracking lists
         self.on_start_calls: list[dict] = []
@@ -360,16 +379,27 @@ class TestProcessRequest:
         assert engine.stats.requests_count == 0
 
     @pytest.mark.asyncio
-    async def test_blocked_response_triggers_retry(self):
+    @pytest.mark.parametrize("strategy", ["bfs", "dfs"])
+    async def test_blocked_response_triggers_retry(self, strategy):
         spider = MockSpider(is_blocked_fn=lambda r: True, max_blocked_retries=2)
         engine = _make_engine(spider=spider)
+        engine.scheduler = Scheduler(crawl_strategy=strategy)
 
+        other = Request("https://example.com/other", sid="default")
+        await engine.scheduler.enqueue(other)
         request = Request("https://example.com", sid="default")
         await engine._process_request(request)
 
         assert engine.stats.blocked_requests_count == 1
         # A retry request should be enqueued
         assert not engine.scheduler.is_empty
+        assert await engine.scheduler.dequeue() is other
+        retry = await engine.scheduler.dequeue()
+        assert retry.url == request.url
+        assert retry.priority == -1
+        assert request.priority == 0
+        assert retry._retry_count == 1
+        assert retry.dont_filter
 
     @pytest.mark.asyncio
     async def test_blocked_response_max_retries_exceeded(self):
@@ -613,8 +643,7 @@ class TestCheckpointMethods:
     @pytest.mark.asyncio
     async def test_restore_from_checkpoint_raises_when_disabled(self):
         engine = _make_engine()  # no crawldir → checkpoint disabled
-        with pytest.raises(RuntimeError):
-            await engine._restore_from_checkpoint()
+        assert (await engine._restore_from_checkpoint()) is False
 
 
 # ---------------------------------------------------------------------------
@@ -913,3 +942,71 @@ class TestPauseDuringCrawl:
         await engine.crawl()
 
         assert engine.paused is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: _prefetch_robots_txt
+# ---------------------------------------------------------------------------
+
+
+class TestPrefetchRobotsTxt:
+    """_prefetch_robots_txt warms the robots.txt cache before the crawl loop."""
+
+    @staticmethod
+    def _make_counting_fetch():
+        """Return (fetch_fn, calls_list) where calls_list records every (url, sid) pair."""
+        calls: list[tuple[str, str]] = []
+
+        async def _fetch(url: str, sid: str):
+            calls.append((url, sid))
+            return MockResponse(status=200, body=b"", url=url)
+
+        return _fetch, calls
+
+    @pytest.mark.asyncio
+    async def test_prefetch_uses_start_urls(self):
+        fetch_fn, calls = self._make_counting_fetch()
+        spider = MockSpider(robots_txt_obey=True, start_urls=["https://example.com/page1"])
+        engine = _make_engine(spider=spider)
+        engine._robots_manager = RobotsTxtManager(fetch_fn)
+
+        await engine._prefetch_robots_txt()
+
+        assert len(calls) == 1
+        assert calls[0][0] == "https://example.com/robots.txt"
+
+    @pytest.mark.asyncio
+    async def test_prefetch_noop_when_robots_disabled(self):
+        fetch_fn, calls = self._make_counting_fetch()
+        spider = MockSpider(robots_txt_obey=False)
+        engine = _make_engine(spider=spider)
+
+        assert engine._robots_manager is None
+
+        await engine._prefetch_robots_txt()
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_prefetch_noop_when_start_urls_empty(self):
+        fetch_fn, calls = self._make_counting_fetch()
+        spider = MockSpider(robots_txt_obey=True, start_urls=[])
+        engine = _make_engine(spider=spider)
+        engine._robots_manager = RobotsTxtManager(fetch_fn)
+
+        await engine._prefetch_robots_txt()
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_prefetch_deduplicates_same_domain_in_start_urls(self):
+        fetch_fn, calls = self._make_counting_fetch()
+        spider = MockSpider(robots_txt_obey=True, start_urls=["https://example.com/a", "https://example.com/b"])
+        engine = _make_engine(spider=spider)
+        engine._robots_manager = RobotsTxtManager(fetch_fn)
+
+        await engine._prefetch_robots_txt()
+
+        # set of Request.domain values deduplicates to one task per domain
+        assert len(calls) == 1
+        assert calls[0][0] == "https://example.com/robots.txt"
