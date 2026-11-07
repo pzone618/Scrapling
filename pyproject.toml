@@ -110,7 +110,7 @@ test = [
     "scrapy",
 ]
 docs = [
-    "zensical>=0.0.70",
+    "zensical>=0.0.70; python_version >= '3.11'",  # zensical dropped 3.10
     "mkdocstrings>=1.0.6",
     "mkdocstrings-python>=2.0.5",
     "griffe-inherited-docstrings>=1.1.3",

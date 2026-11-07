@@ -107,10 +107,10 @@ text = page.find_by_text('关键词')           # 文本搜索
 
 ### 2. 动态页面（JavaScript 渲染）
 ```python
-from scrapling.fetchers import DynamicFetcher
+from scrapling.fetchers import StealthyFetcher
 
-# 使用真实浏览器
-page = DynamicFetcher.fetch(
+# 使用真实浏览器（v0.5 起 DynamicFetcher 已移除，统一使用 StealthyFetcher）
+page = StealthyFetcher.fetch(
     'https://example.com',
     headless=True,           # 无头模式
     network_idle=True        # 等待网络加载完成
@@ -245,7 +245,7 @@ scrapling shell
 ### 2. 性能优化
 ```python
 # 禁用不必要的资源加载（图片、CSS）
-page = DynamicFetcher.fetch(
+page = StealthyFetcher.fetch(
     url,
     disable_resources=True,  # 禁用图片等资源
     headless=True

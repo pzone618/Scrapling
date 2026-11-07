@@ -24,11 +24,11 @@ uv run scrapling extract get 'https://quotes.toscrape.com' quotes.html
 # 使用 CSS 选择器提取特定部分
 uv run scrapling extract get 'https://quotes.toscrape.com' quotes.md --css-selector '.quote'
 
-# 使用浏览器模式（处理 JavaScript）
+# 使用浏览器模式（处理 JavaScript，v0.5 起底层为 StealthyFetcher）
 uv run scrapling extract fetch 'https://example.com' content.md --no-headless
 
-# 使用隐身模式绕过反爬虫
-uv run scrapling extract stealthy-fetch 'https://protected-site.com' content.html --solve-cloudflare
+# 绕过 Cloudflare（v0.5 起 stealthy-fetch 已合并进 fetch）
+uv run scrapling extract fetch 'https://protected-site.com' content.html --solve-cloudflare
 
 # 伪装成特定浏览器
 uv run scrapling extract get 'https://example.com' content.txt --impersonate chrome
